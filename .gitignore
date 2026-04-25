@@ -30,6 +30,7 @@ htmlcov/
 # ML artifacts (too large for git; rebuild from requirements + dataset)
 checkpoints/
 onnx_exports/
+torchviz_exports/
 *.pt
 *.pth
 *.ckpt

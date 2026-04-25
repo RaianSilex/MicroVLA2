@@ -24,6 +24,8 @@ behind the model, how to train it, and how to run it on the robot.
    - [`train.py`](#58-trainpy)
    - [`evaluate.py`](#59-evaluatepy)
    - [`export_onnx.py`](#510-export_onnxpy)
+   - [`viz_torchviz.py`](#511-viz_torchvizpy)
+   - [`viz_summary.py`](#512-viz_summarypy)
 6. [How to Train](#6-how-to-train)
 7. [How to Run Inference (ROS2 Integration)](#7-how-to-run-inference-ros2-integration)
 8. [`train.py` CLI Reference](#8-trainpy-cli-reference)
@@ -165,6 +167,8 @@ MicroACT/
 ├── train.py                   # CLI training entry point
 ├── evaluate.py                # (intentionally empty; offline sanity script TODO)
 ├── export_onnx.py             # exports model to ONNX for Netron visualization
+├── viz_torchviz.py            # renders autograd-graph SVGs with torchviz
+├── viz_summary.py             # prints layer-level Keras-style summary table
 ├── utils.py                   # seeding, optimizer, AverageMeter, ckpt IO
 ├── requirements.txt
 ├── README.md
@@ -729,6 +733,85 @@ See [§10](#10-visualizing-the-model-architecture) for how to view them.
 
 ---
 
+### 5.11 `viz_torchviz.py`
+
+**Role:** developer tool. Renders the model's **autograd graph** as SVG
+files via `torchviz`. Complements `export_onnx.py` — Netron shows the
+*architecture* (clean module-level boxes), torchviz shows the *operations*
+(every add, matmul, layernorm, softmax, transpose).
+
+**Components:**
+
+- `render(out, output_tensor, params, label)` — thin wrapper around
+  `torchviz.make_dot(...)` that writes a single SVG with `cleanup=True`
+  (no leftover `.dot` files).
+- `main()` builds a fresh CVAE and renders four SVGs at increasing
+  scope:
+
+| File | Scope | Typical size |
+|---|---|---|
+| `01_backbone.svg` | ResNet18 + 1×1 projection only | ~90 KB |
+| `02_style_encoder.svg` | CVAE style encoder branch only | ~230 KB |
+| `03_inference_full.svg` | Full inference forward pass | ~950 KB |
+| `04_training_full.svg` | Full training forward pass | ~1.2 MB |
+
+**Why four files?** The full graphs have thousands of nodes — readable
+when zoomed but overwhelming as an entry point. The focused sub-graphs
+let you understand one piece at a time.
+
+**Requirements:** `pip install torchviz` and a working `graphviz` system
+package (`apt install graphviz` provides the `dot` binary). Both are
+already installed in this environment.
+
+See [§10.5](#105-when-to-use-which-tool) for when to use this vs Netron.
+
+---
+
+### 5.12 `viz_summary.py`
+
+**Role:** developer tool. Prints a Keras-style **layer summary** to
+stdout — every named layer, its input/output shape, and parameter
+count. No graph, no math ops, no SVG. The most scannable of the three
+visualization tools.
+
+**Components:**
+
+- `main(depth=4)` builds a fresh CVAE and prints two things:
+  1. `print(cvae)` — the raw `nn.Module` hierarchy (names only, no
+     shapes).
+  2. `torchinfo.summary(cvae, ...)` for both the inference and training
+     forward paths, with `col_names=("input_size", "output_size",
+     "num_params")`.
+
+**Requirements:** `pip install torchinfo`. No system packages.
+
+**Output:** ~300 lines of formatted text to stdout. To save:
+
+```bash
+python viz_summary.py > architecture.txt
+```
+
+**Example excerpt** (top of the inference table):
+
+```
+ACTCVAE                                    [1,1,3,240,320]  [1,100,8]      17,480,768
+├─Backbone: 1-1                            [1,3,240,320]    [1,512,8,10]   --
+│    └─ResNet18Backbone: 2-1               [1,3,240,320]    [1,512,8,10]   --
+│    └─Conv2d: 2-2                         [1,512,8,10]     [1,512,8,10]   262,656
+├─Transformer: 1-4                         [82,1,512]       [100,1,512]    --
+│    └─TransformerEncoder: 2-4 (×4)        [82,1,512]       [82,1,512]     17,332,736
+│    └─TransformerDecoder: 2-5 (×7)        [100,1,512]      [100,1,512]    37,694,848
+├─Linear: 1-5  (action head)               [1,100,512]      [1,100,8]      4,104
+=========================================================================================
+Total params: 83,963,528
+Estimated Total Size (MB): 264.29
+```
+
+See [§10.5](#105-when-to-use-which-tool) for when to use this vs the
+other two tools.
+
+---
+
 ## 6. How to Train
 
 ### 6.1 First-time setup
@@ -1106,10 +1189,63 @@ emit a small "style code" that conditions the rest of the network.
 - **Disk usage.** ~575 MB total per export. `onnx_exports/` and
   `*.onnx`/`*.onnx.data` are in `.gitignore` so you won't commit them
   by accident.
-- **Architecture-only summary instead?** If you want a quick text table
-  (every layer, output shape, param count) without the visual graph,
-  install `pip install torchinfo` and call `summary(model, ...)`. Faster
-  than ONNX export for a sanity check, but no graph.
+- **Want a fast text-only summary instead?** Use `viz_summary.py`
+  ([§5.12](#512-viz_summarypy)) — no graph, just a layer-by-layer table.
+
+### 10.5 When to use which tool
+
+Three visualization tools ship in this repo. They answer different
+questions and produce wildly different output sizes — pick the one that
+matches what you're actually trying to understand.
+
+| Tool | Script | Output | Granularity | Use when... |
+|---|---|---|---|---|
+| **torchinfo** | `viz_summary.py` | ~300 lines text | One row per `nn.Module` (no math ops) | You want a scannable list: "what layers exist? what's their size? how many params?" |
+| **Netron** | `export_onnx.py` | Interactive web view | One box per ONNX op (~50 boxes module-level) | You want a clickable architecture diagram with shape arrows |
+| **torchviz** | `viz_torchviz.py` | 4 × SVG (90 KB – 1.2 MB) | One box per autograd op (~5,000 ops total) | You're debugging gradients: "is this branch traced?", "where does the loss flow?" |
+
+#### Recommended order for a newcomer
+
+1. **Start with `viz_summary.py`** to learn the model in 5 minutes. Pure
+   text, no install beyond `pip install torchinfo`. Tells you *what
+   pieces exist*.
+2. **Then `export_onnx.py` + Netron** to see *how the pieces connect*.
+   Module-level visual flow.
+3. **Reach for `viz_torchviz.py` only when debugging.** Seeing every
+   autograd op is overkill for understanding architecture — but
+   essential when a gradient is zero and you need to know why.
+
+#### Running each
+
+```bash
+# Layer summary (fastest, no install beyond torchinfo)
+pip install torchinfo
+python viz_summary.py
+python viz_summary.py > architecture.txt    # save to file
+
+# ONNX for Netron (drag .onnx into https://netron.app)
+python export_onnx.py
+
+# Autograd graph (graphviz system pkg + torchviz pip pkg)
+pip install torchviz
+python viz_torchviz.py
+```
+
+Outputs from `viz_torchviz.py` (`torchviz_exports/`):
+
+```
+01_backbone.svg          ResNet18 + 1x1 projection only        (~90 KB)
+02_style_encoder.svg     CVAE branch: (qpos, actions) -> mu/logvar  (~230 KB)
+03_inference_full.svg    Full deployment forward pass          (~950 KB)
+04_training_full.svg     Full training forward pass             (~1.2 MB)
+```
+
+SVG is vector — open in any browser and zoom freely. Start with
+`01_backbone.svg` and `02_style_encoder.svg` to learn the conventions
+(blue ovals = parameters, grey rectangles = autograd ops, orange =
+saved tensors).
+
+`onnx_exports/` and `torchviz_exports/` are gitignored.
 
 ---
 
