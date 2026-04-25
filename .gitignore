@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+
+# Testing / coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ML artifacts (too large for git; rebuild from requirements + dataset)
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.pkl
+
+# Dataset (use external storage / Git LFS, not git)
+dataset/saved_frames/
+dataset/saved_videos/
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Tooling caches
+.codex
