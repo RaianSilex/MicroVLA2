@@ -152,7 +152,7 @@ MicroACT/
 │   └── dataset.py             # CSV+image dataset, normalization, padding
 ├── model/
 │   ├── __init__.py
-│   ├── backbone.py            # ResNet18 + 2D sine pos embed
+│   ├── backbone.py            # ResNet18 + DINOv2 (selectable) + 2D sine pos embed
 │   ├── transformer.py         # DETR-style encoder + decoder blocks
 │   ├── cvae.py                # ACTCVAE: style encoder + main encoder-decoder
 │   └── act_policy.py          # ACTPolicy: loss + numpy inference
@@ -305,7 +305,7 @@ Every other file imports from here so nothing is hardcoded twice.
 | Robot shapes (`STATE_DIM=8`, `ACTION_DIM=8`, `NUM_CAMERAS=1`, `IMAGE_HEIGHT=240`, `IMAGE_WIDTH=320`) | The "data contract" — change these and the model auto-resizes. |
 | CSV column tuples (`CSV_STATE_COLS`, `CSV_ACTION_COLS`, `CSV_IMAGE_COL`) | Exactly the columns that `data/dataset.py` reads. Adding the focus motor or solenoid logging later is a one-line change here. |
 | ACT hyperparameters (`CHUNK_SIZE=100`, `HIDDEN_DIM=512`, `DIM_FEEDFORWARD=3200`, `ENC_LAYERS=4`, `DEC_LAYERS=7`, `NHEAD=8`, `LATENT_DIM=32`, `KL_WEIGHT=10`) | Match the ACT paper; safe defaults. |
-| Backbone (`BACKBONE="resnet18"`, `BACKBONE_PRETRAINED=True`) | ImageNet weights help convergence. |
+| Backbone (`BACKBONE="resnet18"`, `BACKBONE_PRETRAINED=True`) | Default backbone. Override via `--backbone resnet18 \| dinov2_vits14 \| dinov2_vitb14 \| dinov2_vitl14` on any entry-point script — see [§5.3](#53-modelbackbonepy). |
 | Training (`BATCH_SIZE=8`, `NUM_EPOCHS=2000`, `LR=1e-5`, `LR_BACKBONE=1e-5`, `WEIGHT_DECAY=1e-4`, `SEED=0`, `DEVICE="cuda"`) | Paper defaults. |
 | Rollout (`OPEN_LOOP_HORIZON=8`, `CONTROL_HZ=5.0`, `TEMPORAL_AGG=True`, `TEMPORAL_AGG_K=0.01`) | Used by the ROS2 rollout script you'll write. |
 
@@ -380,6 +380,18 @@ Convenience factory. Returns a ready-to-use `EpisodicDataset`. Set
 ### 5.3 `model/backbone.py`
 
 **Role:** turn an image into a sequence of tokens for the transformer.
+Two backbone families are supported; selection is by string name and
+the rest of the model sees an identical `(feat, pos)` interface
+regardless of which backbone is active.
+
+**Supported backbones**
+
+| Name | Architecture | Params | Trainable by default | Notes |
+|---|---|---|---|---|
+| `resnet18` | torchvision ResNet18 + FrozenBN | 11.2 M | yes | ImageNet-pretrained, fine-tuned end-to-end. ACT paper default. |
+| `dinov2_vits14` | DINOv2 ViT-S/14 | 21.6 M | no (frozen) | Self-supervised foundation features. ~21 M frozen + tiny trainable head. |
+| `dinov2_vitb14` | DINOv2 ViT-B/14 | 86.2 M | no (frozen) | Bigger DINOv2 — slower, marginally better features. |
+| `dinov2_vitl14` | DINOv2 ViT-L/14 | 304 M | no (frozen) | Largest stable DINOv2; rarely worth the cost for behavior cloning. |
 
 **Components:**
 
@@ -387,6 +399,7 @@ Convenience factory. Returns a ready-to-use `EpisodicDataset`. Set
 A `BatchNorm2d` whose running statistics and affine parameters are
 frozen as buffers. This is the DETR convention for low-batch fine-tuning;
 otherwise the BN running statistics would lurch around at batch size 8.
+Only used by `ResNet18Backbone`.
 
 #### `ResNet18Backbone`
 - Builds a torchvision ResNet18 with `norm_layer=FrozenBatchNorm2d`.
@@ -398,6 +411,24 @@ otherwise the BN running statistics would lurch around at batch size 8.
 For 240×320 input → output is `(B, 512, 8, 10)` = **80 spatial tokens**
 per image after flattening.
 
+#### `DinoV2Backbone`
+- Loads a DINOv2 ViT from `torch.hub` (`facebookresearch/dinov2`). First
+  call downloads ~85 MB (ViT-S) → ~1 GB (ViT-L) into
+  `~/.cache/torch/hub/`.
+- Frozen by default (`freeze=True`). All DINOv2 parameters get
+  `requires_grad=False` and the submodule is forced into `eval()` mode
+  even when the parent module is in train mode — this disables any
+  training-only ops (e.g. drop path) that DINOv2 has internally.
+- Bilinearly resizes input to the nearest multiple of patch size (14)
+  on the fly. For 240×320 → 238×322 → **17×23 = 391 spatial tokens**.
+- Uses `forward_features(x)["x_norm_patchtokens"]` to get patch tokens,
+  drops the `[CLS]` token, and reshapes back to `(B, D, H', W')` so the
+  rest of the pipeline doesn't have to know which backbone produced
+  the features.
+
+Embedding dim per variant: ViT-S=384, ViT-B=768, ViT-L=1024. The 1×1
+projection in `Backbone` rescales whichever down to `HIDDEN_DIM=512`.
+
 #### `PositionEmbeddingSine2D`
 A 2D sinusoidal position encoding. Each `(row, col)` position gets a
 fixed embedding with sinusoids at multiple frequencies — half the
@@ -405,16 +436,38 @@ channels encode row, the other half encode column. Identical to the
 DETR formulation, allowing the transformer to recover spatial structure
 that the flatten step destroyed.
 
+> **Note:** DINOv2 already adds *its own* learned positional encoding
+> internally. We add a sine pos on top regardless because the main
+> ACT transformer expects one. Empirically harmless — the redundant
+> info is just additional positional signal.
+
 #### `Backbone` (combined wrapper)
-- Runs the ResNet,
-- Projects the 512-channel feature map down to `HIDDEN_DIM` (512) with
-  a 1×1 conv,
-- Generates a matching position embedding.
+- Dispatches on `backbone_name` to instantiate either
+  `ResNet18Backbone` or `DinoV2Backbone`,
+- Stores the right submodule under `self.resnet` or `self.dinov2`
+  (preserves existing checkpoint compatibility for ResNet runs),
+- Projects the backbone's channel count down to `HIDDEN_DIM` with a
+  1×1 conv,
+- Generates a matching `PositionEmbeddingSine2D`.
 
 Returns `(feat, pos)` both of shape `(B, hidden_dim, H', W')`.
 
-#### `build_backbone()`
-Tiny factory. Used by `ACTCVAE`.
+#### `build_backbone(backbone_name=None, freeze=True, ...)`
+Factory. `backbone_name=None` falls back to `config.BACKBONE`
+(default `"resnet18"`). `freeze` only matters for DINOv2.
+
+#### Memory + token-count tradeoff
+
+| Backbone | Spatial tokens (240×320) | Main encoder seq length | Trainable params (with rest of ACT) |
+|---|---|---|---|
+| `resnet18` | 80 | 82 (80 img + z + qpos) | ~84 M |
+| `dinov2_vits14` (frozen) | 391 | 393 | ~73 M |
+| `dinov2_vitb14` (frozen) | 391 | 393 | ~73 M |
+
+DINOv2 paths produce **~5× more image tokens** than ResNet18, which
+means the main encoder/decoder do more work per sample (longer
+attention), even though the *backbone* itself is frozen. Plan for
+~1.5–2× the train step time on DINOv2 vs ResNet18.
 
 ---
 
@@ -708,23 +761,26 @@ clickable node graph. Not part of the training or inference pipeline.
   `forward(image, qpos, actions, is_pad)` returns `(a_hat, mu, logvar)`.
   Captures the training path including the CVAE style encoder.
 - `main()` builds a fresh randomly-initialized CVAE, exports both
-  wrappers to `onnx_exports/act_inference.onnx` and
-  `onnx_exports/act_training.onnx` with opset 18, and prints the next
-  steps.
+  wrappers to `onnx_exports/<backbone>/act_inference.onnx` and
+  `act_training.onnx` with opset 18, and prints the next steps.
 
 **Why two wrappers?** ONNX export traces a single execution path. The
 real `ACTCVAE.forward` branches on whether `actions` is provided, so
 one trace can't capture both cases. The two wrappers force the export
 down each path explicitly.
 
-**Output layout** (`onnx_exports/`):
+**`--backbone` flag.** Pass `--backbone resnet18` (default) or
+`--backbone dinov2_vits14` etc. to export either architecture. Outputs
+go into a per-backbone subdirectory so the two never collide.
 
-| File | Size | Purpose |
+**Output layout** (`onnx_exports/<backbone>/`):
+
+| File | Size (resnet18 / dinov2_vits14) | Purpose |
 |---|---|---|
-| `act_inference.onnx` | ~1.5 MB | Graph topology — drag this into Netron |
-| `act_inference.onnx.data` | ~254 MB | Weight blobs (sidecar) |
-| `act_training.onnx` | ~1.8 MB | Graph topology with style encoder branch |
-| `act_training.onnx.data` | ~321 MB | Weight blobs (sidecar) |
+| `act_inference.onnx` | ~1.5 / ~1.9 MB | Graph topology — drag this into Netron |
+| `act_inference.onnx.data` | ~254 / ~295 MB | Weight blobs (sidecar) |
+| `act_training.onnx` | ~1.8 / ~2.2 MB | Graph topology with style encoder branch |
+| `act_training.onnx.data` | ~321 / ~362 MB | Weight blobs (sidecar) |
 
 The `.onnx` and `.onnx.data` pair go together. Both are gitignored.
 
@@ -745,18 +801,27 @@ files via `torchviz`. Complements `export_onnx.py` — Netron shows the
   `torchviz.make_dot(...)` that writes a single SVG with `cleanup=True`
   (no leftover `.dot` files).
 - `main()` builds a fresh CVAE and renders four SVGs at increasing
-  scope:
+  scope into `torchviz_exports/<backbone>/`:
 
-| File | Scope | Typical size |
+| File | Scope | Size (resnet18 / dinov2_vits14 frozen) |
 |---|---|---|
-| `01_backbone.svg` | ResNet18 + 1×1 projection only | ~90 KB |
+| `01_backbone.svg` | Backbone + 1×1 projection only | ~90 KB / ~5 KB |
 | `02_style_encoder.svg` | CVAE style encoder branch only | ~230 KB |
-| `03_inference_full.svg` | Full inference forward pass | ~950 KB |
-| `04_training_full.svg` | Full training forward pass | ~1.2 MB |
+| `03_inference_full.svg` | Full inference forward pass | ~950 / ~860 KB |
+| `04_training_full.svg` | Full training forward pass | ~1.2 / ~1.1 MB |
+
+The DINOv2 `01_backbone.svg` is much smaller because the backbone is
+frozen — the autograd graph stops at its output, so the SVG only shows
+the trainable `input_proj` + sine pos. Pass `--unfreeze-backbone` if
+you want to see DINOv2's internal ops too (much larger graph).
 
 **Why four files?** The full graphs have thousands of nodes — readable
 when zoomed but overwhelming as an entry point. The focused sub-graphs
 let you understand one piece at a time.
+
+**`--backbone` flag.** Same as `export_onnx.py` — pass `--backbone
+resnet18 | dinov2_vits14 | ...`. Outputs go to per-backbone
+subdirectories so they don't overwrite each other.
 
 **Requirements:** `pip install torchviz` and a working `graphviz` system
 package (`apt install graphviz` provides the `dot` binary). Both are
@@ -992,8 +1057,8 @@ needed.
 |---|---|---|
 | `--epochs` | `2000` | Number of training epochs. One epoch = one full pass over the train split. |
 | `--batch-size` | `8` | Samples per gradient step. Memory grows roughly linearly. |
-| `--lr` | `1e-5` | AdamW learning rate for everything *except* the ResNet backbone. |
-| `--lr-backbone` | `1e-5` | AdamW learning rate for the ResNet backbone parameters. Lower than `--lr` is sometimes useful when fine-tuning ImageNet weights. |
+| `--lr` | `1e-5` | AdamW learning rate for everything *except* the backbone. |
+| `--lr-backbone` | `1e-5` | AdamW learning rate for backbone parameters. Lower than `--lr` is sometimes useful when fine-tuning ImageNet weights. Has no effect on frozen DINOv2 (no gradients to optimize). |
 | `--weight-decay` | `1e-4` | AdamW weight decay (applied to all groups). |
 | `--seed` | `0` | Random seed for python/numpy/torch + dataset split. |
 | `--device` | `"cuda"` | `"cuda"`, `"cuda:1"`, `"cpu"`, etc. Falls back to CPU with a warning if CUDA isn't available. |
@@ -1003,7 +1068,9 @@ needed.
 | `--save-every` | `100` | Write a numbered `policy_epochN.pt` checkpoint every N epochs (in addition to `policy_last.pt` and `policy_best.pt`). |
 | `--ckpt-dir` | `checkpoints/` | Where to write all checkpoint files and `dataset_stats.pkl`. Point to an external disk if `/` is tight. |
 | `--resume` | none | Path to a checkpoint to resume from. Restores model weights, optimizer state, and the epoch counter. |
-| `--no-pretrained` | off | Skip downloading the ImageNet ResNet18 weights. Useful for offline boxes or smoke tests; you almost never want this for real training. |
+| `--no-pretrained` | off | Skip downloading the ImageNet ResNet18 weights. Has no effect on DINOv2 (always loads pretrained from torch.hub). Useful for offline boxes or smoke tests; you almost never want this for real training. |
+| `--backbone` | `resnet18` | Image backbone selection: `resnet18`, `dinov2_vits14`, `dinov2_vitb14`, `dinov2_vitl14`. DINOv2 variants download from torch.hub on first use. See [§5.3](#53-modelbackbonepy) and [§9.10](#910-backbone-choice). |
+| `--unfreeze-backbone` | off | DINOv2 backbones are frozen by default. Pass this to fine-tune them — rarely needed and significantly increases VRAM/compute. No effect on `resnet18` (already trainable). |
 
 ### Examples
 
@@ -1039,6 +1106,18 @@ python train.py \
 **External checkpoint dir (low root-disk):**
 ```bash
 python train.py --ckpt-dir /mnt/data/microact_ckpts
+```
+
+**Train with a DINOv2 backbone (frozen):**
+```bash
+python train.py --backbone dinov2_vits14
+# or:
+python train.py --backbone dinov2_vitb14
+```
+
+**Fine-tune the DINOv2 backbone (rarely needed):**
+```bash
+python train.py --backbone dinov2_vits14 --unfreeze-backbone --lr-backbone 1e-6
 ```
 
 ---
@@ -1159,6 +1238,41 @@ trials" instead of "fraction of timesteps."
 2. Trial-level held-out val loss (`--val-by-trial`) — predicts generalization.
 3. Timestep-level random val loss (default) — sanity check that training is progressing; **not** a generalization metric.
 
+### 9.10 Backbone choice
+
+Pick `--backbone` based on dataset size, training budget, and how much
+visual variation your task involves.
+
+| Backbone | When to use | Tradeoffs |
+|---|---|---|
+| `resnet18` (default) | Small dataset (<100 trials), tight compute, you want the **ACT paper baseline** | Trainable end-to-end; smallest token budget (80 tokens) → fastest training. Pretrained on ImageNet which doesn't match microscope imagery. |
+| `dinov2_vits14` | You suspect ImageNet features aren't general enough for your microscope view (focus drift, lighting changes, novel cell morphology) | ~21 M frozen params. Self-supervised features generalize better across domains. Produces ~5× more spatial tokens → ~2× train step time. |
+| `dinov2_vitb14` | You have GPU headroom and want a stronger feature extractor | ~86 M frozen params. Marginal gain vs ViT-S unless you have a lot of visual variation. |
+| `dinov2_vitl14` | You're benchmarking / writing an ablation table | ~300 M frozen. Significant memory; usually not worth the cost for behavior cloning. |
+
+**Practical heuristic.** Start with `resnet18` for quick iteration. Once
+you have a working pipeline with ≥50 trials, run `dinov2_vits14` as a
+side-by-side experiment. If DINOv2 gives a meaningful val-loss drop or
+better generalization to *new* trials (use `--val-by-trial`), switch.
+If it doesn't, ResNet18's faster training wins.
+
+**On freezing.** DINOv2 is designed as a frozen feature extractor —
+the entire point is that the SSL pretraining produces features general
+enough that downstream tasks don't need to fine-tune. Empirically:
+
+- **Frozen (default)**: faster, lower VRAM, often equivalent quality.
+- **Unfrozen** (`--unfreeze-backbone --lr-backbone 1e-6`): rarely
+  helpful, much slower, easy to wreck pretrained features with too
+  high a LR.
+
+Stick with frozen unless you have a clear reason and a very small
+backbone learning rate.
+
+**Switching mid-project.** Checkpoints are not interchangeable across
+backbones (different shapes for `input_proj` and the parameter set).
+If you switch backbones, you start training from scratch (the rest of
+the network is randomly initialized regardless of backbone choice).
+
 ---
 
 ## 10. Visualizing the Model Architecture
@@ -1170,17 +1284,24 @@ shape, every connection — export the model to ONNX and open it in
 ### 10.1 One-time export
 
 ```bash
-python export_onnx.py
+python export_onnx.py                          # default: resnet18
+python export_onnx.py --backbone dinov2_vits14 # DINOv2 variant
 ```
 
-This writes four files into `onnx_exports/`:
+This writes four files into `onnx_exports/<backbone>/`:
 
 ```
 onnx_exports/
-├── act_inference.onnx       1.5 MB  ← the graph (drop this in Netron)
-├── act_inference.onnx.data  254 MB  ← weight blobs (sidecar)
-├── act_training.onnx        1.8 MB  ← graph including style encoder
-└── act_training.onnx.data   321 MB  ← weight blobs (sidecar)
+├── resnet18/
+│   ├── act_inference.onnx       1.5 MB  ← graph topology (drop in Netron)
+│   ├── act_inference.onnx.data  254 MB  ← weight blobs (sidecar)
+│   ├── act_training.onnx        1.8 MB  ← + style encoder branch
+│   └── act_training.onnx.data   321 MB
+└── dinov2_vits14/
+    ├── act_inference.onnx       1.9 MB
+    ├── act_inference.onnx.data  295 MB
+    ├── act_training.onnx        2.2 MB
+    └── act_training.onnx.data   362 MB
 ```
 
 The script builds a **fresh, randomly-initialized** model — weight
@@ -1199,7 +1320,9 @@ display as `<unloaded>`. That's fine for understanding the architecture
 
 ```bash
 pip install netron
-netron onnx_exports/act_inference.onnx     # opens at localhost:8080
+netron onnx_exports/resnet18/act_inference.onnx        # localhost:8080
+# or for the DINOv2 variant:
+netron onnx_exports/dinov2_vits14/act_inference.onnx
 ```
 
 The local web server can read the `.data` sidecar, so you also see
@@ -1209,8 +1332,14 @@ weight values inside each node.
 
 | File | Architecture content |
 |---|---|
-| `act_inference.onnx` | Deployment path: ResNet18 backbone → 1×1 channel projection → main encoder (4 layers, 8 heads) → main decoder (7 layers) with 100 query tokens cross-attending to memory → action head. **No style encoder.** |
-| `act_training.onnx` | Same as inference, **plus** the CVAE style encoder reading `(qpos, actions, is_pad)` and producing `(mu, logvar)`. The latent `z` sampled from this distribution feeds back into the main encoder as one of its source tokens. |
+| `resnet18/act_inference.onnx` | ResNet18 backbone → 1×1 channel projection → main encoder (4 layers, 8 heads) → main decoder (7 layers) with 100 query tokens cross-attending to memory → action head. **No style encoder.** |
+| `resnet18/act_training.onnx` | Same as above, **plus** the CVAE style encoder reading `(qpos, actions, is_pad)` and producing `(mu, logvar)`. |
+| `dinov2_vits14/act_inference.onnx` | Same overall structure but with a DINOv2 ViT-S encoder block in place of ResNet18. The image token sequence is ~5× longer (391 vs 80 tokens). |
+| `dinov2_vits14/act_training.onnx` | DINOv2 inference + style encoder branch. |
+
+Compare `resnet18/act_inference.onnx` vs `dinov2_vits14/act_inference.onnx`
+side by side to see exactly what swapping backbones changes (and what
+stays the same — the entire transformer + style encoder is identical).
 
 Comparing the two side-by-side is the cleanest visual demonstration of
 what the CVAE adds: a parallel encoder branch whose only purpose is to
@@ -1256,28 +1385,38 @@ matches what you're actually trying to understand.
 
 #### Running each
 
+All three scripts accept the same `--backbone` flag — pass `resnet18`
+(default) or `dinov2_vits14` / `dinov2_vitb14` / `dinov2_vitl14`.
+
 ```bash
 # Layer summary (fastest, no install beyond torchinfo)
 pip install torchinfo
-python viz_summary.py
-python viz_summary.py > architecture.txt    # save to file
+python viz_summary.py                           # defaults to config.BACKBONE
+python viz_summary.py --backbone dinov2_vits14
+python viz_summary.py --backbone dinov2_vits14 > architecture_dinov2.txt
 
 # ONNX for Netron (drag .onnx into https://netron.app)
-python export_onnx.py
+python export_onnx.py                           # → onnx_exports/resnet18/
+python export_onnx.py --backbone dinov2_vits14  # → onnx_exports/dinov2_vits14/
 
 # Autograd graph (graphviz system pkg + torchviz pip pkg)
 pip install torchviz
-python viz_torchviz.py
+python viz_torchviz.py                          # → torchviz_exports/resnet18/
+python viz_torchviz.py --backbone dinov2_vits14 # → torchviz_exports/dinov2_vits14/
 ```
 
-Outputs from `viz_torchviz.py` (`torchviz_exports/`):
+Outputs from `viz_torchviz.py` (`torchviz_exports/<backbone>/`):
 
 ```
-01_backbone.svg          ResNet18 + 1x1 projection only        (~90 KB)
+01_backbone.svg          backbone + 1x1 projection only      (~90 KB / ~5 KB DINOv2 frozen)
 02_style_encoder.svg     CVAE branch: (qpos, actions) -> mu/logvar  (~230 KB)
-03_inference_full.svg    Full deployment forward pass          (~950 KB)
-04_training_full.svg     Full training forward pass             (~1.2 MB)
+03_inference_full.svg    Full deployment forward pass        (~950 / ~860 KB)
+04_training_full.svg     Full training forward pass          (~1.2 / ~1.1 MB)
 ```
+
+The DINOv2 `01_backbone.svg` is tiny because the backbone is frozen —
+the autograd graph stops at its output. Pass `--unfreeze-backbone` to
+include DINOv2's internal ops (much larger graph).
 
 SVG is vector — open in any browser and zoom freely. Start with
 `01_backbone.svg` and `02_style_encoder.svg` to learn the conventions

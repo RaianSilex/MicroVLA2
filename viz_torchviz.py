@@ -1,7 +1,7 @@
 """Render the model's autograd graph with torchviz.
 
-Produces SVG files in `torchviz_exports/`. Open them in any browser
-(SVG is vector — zoom freely).
+Produces SVG files in `torchviz_exports/<backbone>/`. Open them in any
+browser (SVG is vector — zoom freely).
 
 Difference from `export_onnx.py`:
   - ONNX/Netron shows the **architecture** (clean, module-level boxes).
@@ -11,8 +11,14 @@ Difference from `export_onnx.py`:
 The full-network graph is huge (thousands of ops). The script also renders
 focused sub-graphs (backbone, transformer, style encoder) which are far
 easier to read.
+
+For frozen backbones (DINOv2 default), the autograd graph stops at the
+backbone output — that's actually informative, since it shows exactly
+what's *trainable*. Pass `--unfreeze-backbone` to also see the inner
+backbone ops.
 """
 
+import argparse
 from pathlib import Path
 
 import torch
@@ -29,11 +35,18 @@ def render(out: Path, output_tensor: torch.Tensor, params: dict, label: str) -> 
     dot.render(out.as_posix(), cleanup=True)
 
 
-def main(out_dir: Path = Path("torchviz_exports")) -> None:
+def main(
+    out_dir: Path = Path("torchviz_exports"),
+    backbone: str = None,
+    freeze_backbone: bool = True,
+) -> None:
+    cvae = build_cvae(backbone_name=backbone, freeze_backbone=freeze_backbone).eval()
+    backbone_name = cvae.backbone.backbone_name
+    out_dir = out_dir / backbone_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cvae = build_cvae().eval()
-    print(f"built cvae: {sum(p.numel() for p in cvae.parameters()) / 1e6:.1f} M params")
+    print(f"built cvae: {sum(p.numel() for p in cvae.parameters()) / 1e6:.1f} M params  "
+          f"(backbone={backbone_name})")
 
     image = torch.zeros(1, C.NUM_CAMERAS, 3, C.IMAGE_HEIGHT, C.IMAGE_WIDTH, requires_grad=True)
     qpos = torch.zeros(1, C.STATE_DIM, requires_grad=True)
@@ -48,7 +61,7 @@ def main(out_dir: Path = Path("torchviz_exports")) -> None:
         out_dir / "01_backbone",
         feat.sum(),  # scalar so make_dot has a single root
         dict(cvae.backbone.named_parameters()),
-        "ResNet18 + 1x1 projection + 2D sine pos embed",
+        f"{backbone_name} + 1x1 projection + 2D sine pos embed",
     )
 
     # --- 2. Style encoder only (CVAE branch, qpos+actions -> mu/logvar) ---
@@ -91,4 +104,12 @@ def main(out_dir: Path = Path("torchviz_exports")) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser()
+    p.add_argument("--backbone", type=str, default=None,
+                   help="resnet18 | dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14. "
+                        "Defaults to config.BACKBONE.")
+    p.add_argument("--unfreeze-backbone", action="store_true",
+                   help="DINOv2 backbones are frozen by default; pass this to render "
+                        "their internal autograd graph too.")
+    args = p.parse_args()
+    main(backbone=args.backbone, freeze_backbone=not args.unfreeze_backbone)

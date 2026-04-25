@@ -1,9 +1,18 @@
 """Image backbone for MicroACT.
 
-ResNet18 with frozen batch norm → 1x1 projection to `hidden_dim` → 2D
-sinusoidal position embedding. One call takes a single image tensor and
-returns (features, pos_embed) matching in shape, ready to be flattened into
-a token sequence for the transformer encoder.
+Two backbone families are supported and selected by the `backbone_name`
+argument (or the `BACKBONE` config constant):
+
+  - `"resnet18"`           — ImageNet-pretrained ResNet18 with frozen BN.
+                             Default. ~11M backbone params.
+  - `"dinov2_vits14"`      — DINOv2 ViT-S/14, frozen by default. ~21M.
+  - `"dinov2_vitb14"`      — DINOv2 ViT-B/14, frozen by default. ~86M.
+  - `"dinov2_vitl14"`      — DINOv2 ViT-L/14, frozen by default. ~300M.
+
+Both paths return spatial features `(B, num_channels, Hp, Wp)`. The wrapper
+`Backbone` then projects to `hidden_dim` with a 1x1 conv and emits a 2D
+sinusoidal position embedding of matching shape, so the rest of the model
+sees an identical interface regardless of backbone.
 
 Multi-camera handling (concatenation along spatial dim, per-camera pos
 offsets, etc.) lives in the CVAE module, not here.
@@ -16,10 +25,20 @@ from typing import Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torchvision
 from torchvision.models._utils import IntermediateLayerGetter
 
 from config import config as C
+
+
+_DINOV2_EMBED_DIMS = {
+    "dinov2_vits14": 384,
+    "dinov2_vitb14": 768,
+    "dinov2_vitl14": 1024,
+    "dinov2_vitg14": 1536,
+}
+_DINOV2_PATCH_SIZE = 14
 
 
 # ---------------------------------------------------------------------------
@@ -75,6 +94,64 @@ class ResNet18Backbone(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# DINOv2 feature extractor (outputs patch tokens reshaped to spatial grid)
+# ---------------------------------------------------------------------------
+
+class DinoV2Backbone(nn.Module):
+    """DINOv2 ViT backbone, frozen by default.
+
+    The model expects spatial dims divisible by the patch size (14). We
+    bilinearly resize on the fly, so the rest of the pipeline is free to
+    use any image shape (we currently use 240x320 → resized to 238x322 =
+    17x23 patches).
+    """
+
+    def __init__(self, name: str = "dinov2_vits14", freeze: bool = True):
+        super().__init__()
+        if name not in _DINOV2_EMBED_DIMS:
+            raise ValueError(
+                f"Unknown DINOv2 variant {name!r}. "
+                f"Choose from {list(_DINOV2_EMBED_DIMS)}."
+            )
+        self.name = name
+        self.num_channels = _DINOV2_EMBED_DIMS[name]
+        self.patch_size = _DINOV2_PATCH_SIZE
+
+        # First call downloads ~85 MB (ViT-S) → ~1 GB (ViT-L) into ~/.cache/torch/hub.
+        self.dinov2 = torch.hub.load("facebookresearch/dinov2", name, verbose=False)
+
+        self.frozen = freeze
+        if freeze:
+            for p in self.dinov2.parameters():
+                p.requires_grad = False
+
+    def train(self, mode: bool = True):
+        # Frozen DINOv2 must stay in eval mode to disable any train-only ops.
+        super().train(mode)
+        if self.frozen:
+            self.dinov2.eval()
+        return self
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 3, H, W). Resize to nearest multiple of patch_size (round down).
+        B, _, H, W = x.shape
+        Hp_full = max(self.patch_size, (H // self.patch_size) * self.patch_size)
+        Wp_full = max(self.patch_size, (W // self.patch_size) * self.patch_size)
+        if (Hp_full, Wp_full) != (H, W):
+            x = F.interpolate(x, size=(Hp_full, Wp_full), mode="bilinear", align_corners=False)
+        Hp, Wp = Hp_full // self.patch_size, Wp_full // self.patch_size
+
+        # forward_features returns a dict with 'x_norm_patchtokens' shape (B, N, D)
+        # where N = Hp * Wp. Skip the CLS token (we use the spatial grid directly).
+        ctx = torch.no_grad() if self.frozen else torch.enable_grad()
+        with ctx:
+            out = self.dinov2.forward_features(x)
+        tokens = out["x_norm_patchtokens"]                            # (B, N, D)
+        feat = tokens.transpose(1, 2).reshape(B, self.num_channels, Hp, Wp)
+        return feat
+
+
+# ---------------------------------------------------------------------------
 # 2D sinusoidal position embedding (DETR-style)
 # ---------------------------------------------------------------------------
 
@@ -119,12 +196,26 @@ class Backbone(nn.Module):
         self,
         hidden_dim: int = C.HIDDEN_DIM,
         pretrained: bool = C.BACKBONE_PRETRAINED,
+        backbone_name: str = None,
+        freeze: bool = True,
     ):
         super().__init__()
-        self.resnet = ResNet18Backbone(pretrained=pretrained)
-        self.input_proj = nn.Conv2d(
-            self.resnet.num_channels, hidden_dim, kernel_size=1
-        )
+        backbone_name = backbone_name or getattr(C, "BACKBONE", "resnet18")
+        self.backbone_name = backbone_name
+
+        if backbone_name == "resnet18":
+            self.resnet = ResNet18Backbone(pretrained=pretrained)
+            num_channels = self.resnet.num_channels
+        elif backbone_name in _DINOV2_EMBED_DIMS:
+            self.dinov2 = DinoV2Backbone(name=backbone_name, freeze=freeze)
+            num_channels = self.dinov2.num_channels
+        else:
+            raise ValueError(
+                f"Unknown backbone {backbone_name!r}. "
+                f"Supported: 'resnet18', {list(_DINOV2_EMBED_DIMS)}"
+            )
+
+        self.input_proj = nn.Conv2d(num_channels, hidden_dim, kernel_size=1)
         self.pos_embed = PositionEmbeddingSine2D(num_pos_feats=hidden_dim // 2)
         self.hidden_dim = hidden_dim
 
@@ -136,7 +227,10 @@ class Backbone(nn.Module):
             feat: (B, hidden_dim, H', W')
             pos:  (B, hidden_dim, H', W')
         """
-        feat = self.resnet(x)
+        if self.backbone_name == "resnet18":
+            feat = self.resnet(x)
+        else:
+            feat = self.dinov2(x)
         feat = self.input_proj(feat)
         pos = self.pos_embed(feat)
         return feat, pos
@@ -145,5 +239,12 @@ class Backbone(nn.Module):
 def build_backbone(
     hidden_dim: int = C.HIDDEN_DIM,
     pretrained: bool = C.BACKBONE_PRETRAINED,
+    backbone_name: str = None,
+    freeze: bool = True,
 ) -> Backbone:
-    return Backbone(hidden_dim=hidden_dim, pretrained=pretrained)
+    return Backbone(
+        hidden_dim=hidden_dim,
+        pretrained=pretrained,
+        backbone_name=backbone_name,
+        freeze=freeze,
+    )

@@ -50,6 +50,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume",       type=Path,  default=None)
     p.add_argument("--no-pretrained", action="store_true",
                    help="Disable ImageNet pretrained weights on the backbone.")
+    p.add_argument("--backbone", type=str, default=C.BACKBONE,
+                   help="Image backbone: resnet18 | dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14. "
+                        "DINOv2 variants download from torch.hub on first use.")
+    p.add_argument("--unfreeze-backbone", action="store_true",
+                   help="DINOv2 backbones are frozen by default. Pass this to fine-tune them.")
     return p.parse_args()
 
 
@@ -131,7 +136,11 @@ def main() -> None:
     policy = build_policy(
         stats=full_ds.norm_stats,
         pretrained_backbone=not args.no_pretrained,
+        backbone_name=args.backbone,
+        freeze_backbone=not args.unfreeze_backbone,
     ).to(device)
+    print(f"backbone: {args.backbone}  "
+          f"(frozen={not args.unfreeze_backbone if args.backbone != 'resnet18' else False})")
     optimizer = build_optimizer(policy, args.lr, args.lr_backbone, args.weight_decay)
 
     start_epoch = 0

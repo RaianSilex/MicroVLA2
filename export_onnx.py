@@ -1,14 +1,17 @@
 """Export the ACT model to ONNX for visualization in Netron.
 
-Produces two files:
+Produces two files under `onnx_exports/<backbone>/`:
   - act_inference.onnx  : forward path used at deployment (image + qpos -> action chunk).
                          No CVAE style encoder.
   - act_training.onnx   : forward path used during training (image + qpos + actions + is_pad
                          -> action chunk + mu + logvar). Includes the style encoder.
 
 After running, open https://netron.app in your browser and drag the .onnx files in.
+
+Use `--backbone` to switch between ResNet18 and DINOv2 variants.
 """
 
+import argparse
 from pathlib import Path
 
 import torch
@@ -48,11 +51,19 @@ class _TrainingWrapper(nn.Module):
         return a_hat, mu, logvar
 
 
-def main(out_dir: Path = Path("onnx_exports"), opset: int = 18) -> None:
+def main(
+    out_dir: Path = Path("onnx_exports"),
+    opset: int = 18,
+    backbone: str = None,
+    freeze_backbone: bool = True,
+) -> None:
+    cvae = build_cvae(backbone_name=backbone, freeze_backbone=freeze_backbone).eval()
+    backbone_name = cvae.backbone.backbone_name
+    out_dir = out_dir / backbone_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    cvae = build_cvae().eval()
-    print(f"built cvae: {sum(p.numel() for p in cvae.parameters()) / 1e6:.1f} M params")
+    print(f"built cvae: {sum(p.numel() for p in cvae.parameters()) / 1e6:.1f} M params  "
+          f"(backbone={backbone_name})")
 
     image = torch.zeros(1, C.NUM_CAMERAS, 3, C.IMAGE_HEIGHT, C.IMAGE_WIDTH)
     qpos = torch.zeros(1, C.STATE_DIM)
@@ -101,4 +112,12 @@ def main(out_dir: Path = Path("onnx_exports"), opset: int = 18) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser()
+    p.add_argument("--backbone", type=str, default=None,
+                   help="resnet18 | dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14. "
+                        "Defaults to config.BACKBONE.")
+    p.add_argument("--unfreeze-backbone", action="store_true",
+                   help="DINOv2 backbones are frozen by default; pass this to include "
+                        "their internal ops in the exported graph.")
+    args = p.parse_args()
+    main(backbone=args.backbone, freeze_backbone=not args.unfreeze_backbone)

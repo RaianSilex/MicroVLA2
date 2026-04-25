@@ -10,7 +10,10 @@ Two views are printed:
 
 Output goes to stdout. Pipe to a file if you want to keep it:
     python viz_summary.py > architecture.txt
+    python viz_summary.py --backbone dinov2_vits14 > architecture_dinov2.txt
 """
+
+import argparse
 
 import torch
 from torchinfo import summary
@@ -19,8 +22,9 @@ from config import config as C
 from model.cvae import build_cvae
 
 
-def main(depth: int = 4) -> None:
-    cvae = build_cvae().eval()
+def main(depth: int = 1, backbone: str = None) -> None:
+    cvae = build_cvae(backbone_name=backbone).eval()
+    print(f"backbone: {cvae.backbone.backbone_name}")
 
     print("=" * 78)
     print("nn.Module hierarchy (names only)")
@@ -59,4 +63,11 @@ def main(depth: int = 4) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    p = argparse.ArgumentParser()
+    p.add_argument("--backbone", type=str, default=None,
+                   help="resnet18 | dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14. "
+                        "Defaults to config.BACKBONE.")
+    p.add_argument("--depth", type=int, default=1,
+                   help="torchinfo nesting depth. 1 = top-level only, 4+ = inner attention.")
+    args = p.parse_args()
+    main(depth=args.depth, backbone=args.backbone)

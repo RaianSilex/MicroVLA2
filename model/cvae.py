@@ -40,6 +40,8 @@ class ACTCVAE(nn.Module):
         chunk_size: int = C.CHUNK_SIZE,
         num_cameras: int = C.NUM_CAMERAS,
         pretrained_backbone: bool = C.BACKBONE_PRETRAINED,
+        backbone_name: str = None,
+        freeze_backbone: bool = True,
     ):
         super().__init__()
         self.state_dim = state_dim
@@ -51,7 +53,10 @@ class ACTCVAE(nn.Module):
 
         # ---- Backbones ----
         self.backbone = build_backbone(
-            hidden_dim=hidden_dim, pretrained=pretrained_backbone
+            hidden_dim=hidden_dim,
+            pretrained=pretrained_backbone,
+            backbone_name=backbone_name,
+            freeze=freeze_backbone,
         )
         self.transformer = build_transformer(d_model=hidden_dim)
         self.style_encoder = build_encoder(d_model=hidden_dim)
