@@ -23,11 +23,13 @@ behind the model, how to train it, and how to run it on the robot.
    - [`utils.py`](#57-utilspy)
    - [`train.py`](#58-trainpy)
    - [`evaluate.py`](#59-evaluatepy)
+   - [`export_onnx.py`](#510-export_onnxpy)
 6. [How to Train](#6-how-to-train)
 7. [How to Run Inference (ROS2 Integration)](#7-how-to-run-inference-ros2-integration)
 8. [`train.py` CLI Reference](#8-trainpy-cli-reference)
 9. [Tuning Guide & Common Gotchas](#9-tuning-guide--common-gotchas)
-10. [Glossary](#10-glossary)
+10. [Visualizing the Model Architecture](#10-visualizing-the-model-architecture)
+11. [Glossary](#11-glossary)
 
 ---
 
@@ -162,6 +164,7 @@ MicroACT/
 │   └── policy_best.pt
 ├── train.py                   # CLI training entry point
 ├── evaluate.py                # (intentionally empty; offline sanity script TODO)
+├── export_onnx.py             # exports model to ONNX for Netron visualization
 ├── utils.py                   # seeding, optimizer, AverageMeter, ckpt IO
 ├── requirements.txt
 ├── README.md
@@ -687,6 +690,45 @@ their dict names.
 
 ---
 
+### 5.10 `export_onnx.py`
+
+**Role:** developer tool. Exports the model to ONNX so you can drag it
+into [Netron](https://netron.app) and view the architecture as a
+clickable node graph. Not part of the training or inference pipeline.
+
+**Components:**
+
+- `_InferenceWrapper(cvae)` — thin `nn.Module` whose `forward(image, qpos)`
+  calls `cvae(image, qpos, actions=None, is_pad=None)` and returns only
+  `a_hat`. Captures the deployment path.
+- `_TrainingWrapper(cvae)` — thin `nn.Module` whose
+  `forward(image, qpos, actions, is_pad)` returns `(a_hat, mu, logvar)`.
+  Captures the training path including the CVAE style encoder.
+- `main()` builds a fresh randomly-initialized CVAE, exports both
+  wrappers to `onnx_exports/act_inference.onnx` and
+  `onnx_exports/act_training.onnx` with opset 18, and prints the next
+  steps.
+
+**Why two wrappers?** ONNX export traces a single execution path. The
+real `ACTCVAE.forward` branches on whether `actions` is provided, so
+one trace can't capture both cases. The two wrappers force the export
+down each path explicitly.
+
+**Output layout** (`onnx_exports/`):
+
+| File | Size | Purpose |
+|---|---|---|
+| `act_inference.onnx` | ~1.5 MB | Graph topology — drag this into Netron |
+| `act_inference.onnx.data` | ~254 MB | Weight blobs (sidecar) |
+| `act_training.onnx` | ~1.8 MB | Graph topology with style encoder branch |
+| `act_training.onnx.data` | ~321 MB | Weight blobs (sidecar) |
+
+The `.onnx` and `.onnx.data` pair go together. Both are gitignored.
+
+See [§10](#10-visualizing-the-model-architecture) for how to view them.
+
+---
+
 ## 6. How to Train
 
 ### 6.1 First-time setup
@@ -997,7 +1039,81 @@ works as a starting point.
 
 ---
 
-## 10. Glossary
+## 10. Visualizing the Model Architecture
+
+For a clickable, zoomable view of the entire network — every layer, every
+shape, every connection — export the model to ONNX and open it in
+[Netron](https://netron.app).
+
+### 10.1 One-time export
+
+```bash
+python export_onnx.py
+```
+
+This writes four files into `onnx_exports/`:
+
+```
+onnx_exports/
+├── act_inference.onnx       1.5 MB  ← the graph (drop this in Netron)
+├── act_inference.onnx.data  254 MB  ← weight blobs (sidecar)
+├── act_training.onnx        1.8 MB  ← graph including style encoder
+└── act_training.onnx.data   321 MB  ← weight blobs (sidecar)
+```
+
+The script builds a **fresh, randomly-initialized** model — weight
+values are meaningless, but the graph structure is exactly what
+`train.py` would optimize. Re-run any time you change the architecture.
+
+### 10.2 Viewing — two options
+
+**Option A: Netron web app (zero install).** Open
+[netron.app](https://netron.app) and drag in `act_inference.onnx`. The
+browser sandbox can't auto-load the `.data` sidecar, so weight tensors
+display as `<unloaded>`. That's fine for understanding the architecture
+— layer types, shapes, and connections all render correctly.
+
+**Option B: Netron desktop / pip (full weight loading).**
+
+```bash
+pip install netron
+netron onnx_exports/act_inference.onnx     # opens at localhost:8080
+```
+
+The local web server can read the `.data` sidecar, so you also see
+weight values inside each node.
+
+### 10.3 What you'll see
+
+| File | Architecture content |
+|---|---|
+| `act_inference.onnx` | Deployment path: ResNet18 backbone → 1×1 channel projection → main encoder (4 layers, 8 heads) → main decoder (7 layers) with 100 query tokens cross-attending to memory → action head. **No style encoder.** |
+| `act_training.onnx` | Same as inference, **plus** the CVAE style encoder reading `(qpos, actions, is_pad)` and producing `(mu, logvar)`. The latent `z` sampled from this distribution feeds back into the main encoder as one of its source tokens. |
+
+Comparing the two side-by-side is the cleanest visual demonstration of
+what the CVAE adds: a parallel encoder branch whose only purpose is to
+emit a small "style code" that conditions the rest of the network.
+
+### 10.4 Notes & gotchas
+
+- **`nn.MultiheadAttention` exports as one fused node.** Netron will show
+  attention as a single block with input/output shapes rather than
+  exposing the internal Q/K/V projections. This is the right level of
+  abstraction for architecture viewing — drill into the source if you
+  need the inner ops.
+- **Opset 18.** Required by torch 2.10 for the internal `aten_split`
+  decomposition. Older opsets fail with a domain-version mismatch error.
+- **Disk usage.** ~575 MB total per export. `onnx_exports/` and
+  `*.onnx`/`*.onnx.data` are in `.gitignore` so you won't commit them
+  by accident.
+- **Architecture-only summary instead?** If you want a quick text table
+  (every layer, output shape, param count) without the visual graph,
+  install `pip install torchinfo` and call `summary(model, ...)`. Faster
+  than ONNX export for a sanity check, but no graph.
+
+---
+
+## 11. Glossary
 
 | Term | Meaning |
 |---|---|
