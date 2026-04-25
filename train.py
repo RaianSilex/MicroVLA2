@@ -14,7 +14,7 @@ from collections import defaultdict
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, Subset, random_split
 
 from config import config as C
 from data.dataset import build_dataset
@@ -39,6 +39,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed",         type=int,   default=C.SEED)
     p.add_argument("--device",       type=str,   default=C.DEVICE)
     p.add_argument("--val-split",    type=float, default=0.1)
+    p.add_argument("--val-by-trial", action="store_true",
+                   help="Split val set by trial instead of by timestep. "
+                        "Avoids adjacent-timestep leakage but needs >=10 trials "
+                        "for a stable val signal. See README.md §9.9.")
     p.add_argument("--num-workers",  type=int,   default=4)
     p.add_argument("--save-every",   type=int,   default=100,
                    help="Save a numbered checkpoint every N epochs (in addition to last/best).")
@@ -86,12 +90,32 @@ def main() -> None:
 
     # ---- Data ----
     full_ds = build_dataset(recompute_stats=True)
-    val_n = max(1, int(round(len(full_ds) * args.val_split)))
-    train_n = len(full_ds) - val_n
-    train_ds, val_ds = random_split(
-        full_ds, [train_n, val_n],
-        generator=torch.Generator().manual_seed(args.seed),
-    )
+
+    if args.val_by_trial:
+        n_trials = len(full_ds.trials)
+        n_val_trials = max(1, int(round(n_trials * args.val_split)))
+        if n_trials - n_val_trials < 1:
+            raise SystemExit(
+                f"--val-by-trial needs at least 2 trials; got {n_trials}. "
+                f"Drop the flag to fall back to timestep-level random_split."
+            )
+        perm = torch.randperm(
+            n_trials, generator=torch.Generator().manual_seed(args.seed)
+        ).tolist()
+        val_trial_set = set(perm[:n_val_trials])
+        train_idx = [i for i, (ti, _) in enumerate(full_ds.index) if ti not in val_trial_set]
+        val_idx   = [i for i, (ti, _) in enumerate(full_ds.index) if ti in val_trial_set]
+        train_ds, val_ds = Subset(full_ds, train_idx), Subset(full_ds, val_idx)
+        val_trial_ids = sorted(full_ds.trials[ti].trial_id for ti in val_trial_set)
+        print(f"trial-level split: held-out trials = {val_trial_ids}")
+    else:
+        val_n = max(1, int(round(len(full_ds) * args.val_split)))
+        train_n = len(full_ds) - val_n
+        train_ds, val_ds = random_split(
+            full_ds, [train_n, val_n],
+            generator=torch.Generator().manual_seed(args.seed),
+        )
+
     print(f"dataset: train={len(train_ds)} val={len(val_ds)}  (total {len(full_ds)})")
 
     loader_kwargs = dict(
