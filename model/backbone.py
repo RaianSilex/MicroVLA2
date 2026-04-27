@@ -1,18 +1,35 @@
 """Image backbone for MicroACT.
 
-Two backbone families are supported and selected by the `backbone_name`
+Three backbone families are supported, selected by the `backbone_name`
 argument (or the `BACKBONE` config constant):
 
   - `"resnet18"`           — ImageNet-pretrained ResNet18 with frozen BN.
                              Default. ~11M backbone params.
-  - `"dinov2_vits14"`      — DINOv2 ViT-S/14, frozen by default. ~21M.
-  - `"dinov2_vitb14"`      — DINOv2 ViT-B/14, frozen by default. ~86M.
-  - `"dinov2_vitl14"`      — DINOv2 ViT-L/14, frozen by default. ~300M.
+  - `"dinov2_vits14"`      — DINOv2 ViT-S/14, frozen by default. ~22M.
+  - `"dinov2_vitb14"`      — DINOv2 ViT-B/14, frozen by default. ~87M.
+  - `"dinov2_vitl14"`      — DINOv2 ViT-L/14, frozen by default. ~304M.
 
-Both paths return spatial features `(B, num_channels, Hp, Wp)`. The wrapper
-`Backbone` then projects to `hidden_dim` with a 1x1 conv and emits a 2D
-sinusoidal position embedding of matching shape, so the rest of the model
-sees an identical interface regardless of backbone.
+Plus a **dual encoder** mode for hybrid generalist + domain-specialist
+features:
+
+  - `"dinov2_vits14+cellpose"` — DINOv2 ViT-S as the primary encoder
+                                  for general scene understanding +
+                                  Cellpose 3 cyto3 U-Net encoder as a
+                                  cell-aware specialist. Both frozen.
+                                  Tokens from each are concatenated and
+                                  tagged with a learned type embedding.
+  - `"resnet18+cellpose"`     — same idea with ResNet18 as primary.
+
+Single-encoder paths return spatial features `(B, num_channels, Hp, Wp)`,
+which the `Backbone` wrapper projects to `hidden_dim`, position-embeds,
+and flattens to a token sequence.
+
+Dual-encoder paths run both encoders independently, project each to
+`hidden_dim`, add a per-encoder type embedding, position-embed each in
+its own normalized coordinate frame, then concatenate along the token
+sequence. Cellpose features are 2x2-avg-pooled before flattening to
+keep the token budget reasonable (240x320 → 7x10 = 70 tokens for
+Cellpose, vs 17x23 = 391 for DINOv2).
 
 Multi-camera handling (concatenation along spatial dim, per-camera pos
 offsets, etc.) lives in the CVAE module, not here.
@@ -21,7 +38,6 @@ offsets, etc.) lives in the CVAE module, not here.
 from __future__ import annotations
 
 import math
-from typing import Tuple
 
 import torch
 import torch.nn as nn
@@ -152,6 +168,86 @@ class DinoV2Backbone(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Cellpose 3 cyto3 U-Net encoder (frozen domain-specialist)
+# ---------------------------------------------------------------------------
+
+_CELLPOSE_WEIGHTS_URL = "https://www.cellpose.org/models/cyto3"
+_CELLPOSE_NBASE = [2, 32, 64, 128, 256]   # cyto3 default U-Net channel widths
+
+
+class CellposeBackbone(nn.Module):
+    """Cellpose 3 cyto3 encoder as a frozen feature extractor.
+
+    Discards the U-Net's decoder + segmentation heads; uses only the
+    deepest encoder feature map at 1/8 resolution, 256 channels. For
+    240x320 RGB input → output is `(B, 256, 30, 40)`.
+
+    The model expects 2-channel input (cyto, nuclei). We map RGB to a
+    single luminance channel and pad the second channel with zeros —
+    fine for microscope footage with no nuclear stain.
+
+    First instantiation downloads ~25 MB of cyto3 weights into
+    `~/.cellpose/models/cyto3`.
+    """
+
+    def __init__(self, freeze: bool = True):
+        super().__init__()
+        # Lazy import: cellpose's package __init__ pulls numba via
+        # cellpose.dynamics, which has a known coverage-package conflict.
+        # The resnet_torch module is pure PyTorch — import only that.
+        from cellpose.resnet_torch import CPnet
+
+        self.net = CPnet(nbase=_CELLPOSE_NBASE, nout=3, sz=3, mkldnn=False)
+        self._load_pretrained()
+        self.num_channels = _CELLPOSE_NBASE[-1]   # 256
+
+        self.frozen = freeze
+        if freeze:
+            for p in self.net.parameters():
+                p.requires_grad = False
+
+        # ImageNet luminance weights, registered as buffers so .to(device)
+        # moves them with the model.
+        self.register_buffer(
+            "_luma_w",
+            torch.tensor([0.299, 0.587, 0.114]).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+    def _load_pretrained(self):
+        import pathlib
+        cache = pathlib.Path.home() / ".cellpose" / "models" / "cyto3"
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        if not cache.exists():
+            torch.hub.download_url_to_file(
+                _CELLPOSE_WEIGHTS_URL, str(cache), progress=False
+            )
+        state = torch.load(cache, map_location="cpu", weights_only=True)
+        self.net.load_state_dict(state, strict=False)
+
+    def train(self, mode: bool = True):
+        # Frozen Cellpose stays in eval mode (BN running stats fixed, etc.)
+        super().train(mode)
+        if self.frozen:
+            self.net.eval()
+        return self
+
+    def _to_2chan(self, x: torch.Tensor) -> torch.Tensor:
+        """RGB (B,3,H,W) → 2-channel (luminance, zero) for Cellpose."""
+        gray = (x * self._luma_w).sum(dim=1, keepdim=True)        # (B, 1, H, W)
+        zero = torch.zeros_like(gray)
+        return torch.cat([gray, zero], dim=1)                      # (B, 2, H, W)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 3, H, W) ImageNet-normalized RGB.
+        x = self._to_2chan(x)
+        ctx = torch.no_grad() if self.frozen else torch.enable_grad()
+        with ctx:
+            feats = self.net.downsample(x)
+        return feats[-1]                                            # (B, 256, H/8, W/8)
+
+
+# ---------------------------------------------------------------------------
 # 2D sinusoidal position embedding (DETR-style)
 # ---------------------------------------------------------------------------
 
@@ -191,7 +287,38 @@ class PositionEmbeddingSine2D(nn.Module):
 # Combined backbone: features + projection + pos embed
 # ---------------------------------------------------------------------------
 
+def _build_single_encoder(name: str, pretrained: bool, freeze: bool):
+    """Returns (module, num_channels) for a single backbone name."""
+    if name == "resnet18":
+        m = ResNet18Backbone(pretrained=pretrained)
+        return m, m.num_channels
+    if name in _DINOV2_EMBED_DIMS:
+        m = DinoV2Backbone(name=name, freeze=freeze)
+        return m, m.num_channels
+    if name == "cellpose":
+        m = CellposeBackbone(freeze=freeze)
+        return m, m.num_channels
+    raise ValueError(
+        f"Unknown backbone {name!r}. Supported: 'resnet18', "
+        f"{list(_DINOV2_EMBED_DIMS)}, 'cellpose'."
+    )
+
+
 class Backbone(nn.Module):
+    """Wraps one or two image feature extractors + projection + pos embed.
+
+    Single-encoder mode (e.g. `backbone_name='resnet18'` or
+    `'dinov2_vits14'`):
+        forward(x) returns (feat, pos) — both shape (B, hidden_dim, Hp, Wp).
+        Backward-compatible with previous Backbone.
+
+    Dual-encoder mode (e.g. `backbone_name='dinov2_vits14+cellpose'`):
+        forward(x) returns (tokens, pos_tokens) — both shape (S, B, hidden_dim).
+        Tokens from the two encoders are concatenated along the sequence
+        dim, each tagged with a learned type embedding. Cellpose features
+        are 2x2-avg-pooled before flattening to keep the token budget down.
+    """
+
     def __init__(
         self,
         hidden_dim: int = C.HIDDEN_DIM,
@@ -202,38 +329,95 @@ class Backbone(nn.Module):
         super().__init__()
         backbone_name = backbone_name or getattr(C, "BACKBONE", "resnet18")
         self.backbone_name = backbone_name
-
-        if backbone_name == "resnet18":
-            self.resnet = ResNet18Backbone(pretrained=pretrained)
-            num_channels = self.resnet.num_channels
-        elif backbone_name in _DINOV2_EMBED_DIMS:
-            self.dinov2 = DinoV2Backbone(name=backbone_name, freeze=freeze)
-            num_channels = self.dinov2.num_channels
-        else:
-            raise ValueError(
-                f"Unknown backbone {backbone_name!r}. "
-                f"Supported: 'resnet18', {list(_DINOV2_EMBED_DIMS)}"
-            )
-
-        self.input_proj = nn.Conv2d(num_channels, hidden_dim, kernel_size=1)
-        self.pos_embed = PositionEmbeddingSine2D(num_pos_feats=hidden_dim // 2)
         self.hidden_dim = hidden_dim
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            x: (B, 3, H, W) image batch (ImageNet-normalized).
-        Returns:
-            feat: (B, hidden_dim, H', W')
-            pos:  (B, hidden_dim, H', W')
-        """
-        if self.backbone_name == "resnet18":
-            feat = self.resnet(x)
+        parts = backbone_name.split("+")
+        self.is_dual = len(parts) > 1
+        if self.is_dual and len(parts) != 2:
+            raise ValueError(
+                f"Only 2-encoder fusion supported, got {len(parts)} parts in "
+                f"{backbone_name!r}"
+            )
+
+        # ---- Build encoder(s) ----
+        primary_name = parts[0]
+        primary, primary_chan = _build_single_encoder(primary_name, pretrained, freeze)
+        self._set_encoder(primary_name, primary)
+
+        if self.is_dual:
+            aux_name = parts[1]
+            aux, aux_chan = _build_single_encoder(aux_name, pretrained, freeze)
+            self._set_encoder(aux_name, aux)
+            self.input_proj_aux = nn.Conv2d(aux_chan, hidden_dim, kernel_size=1)
+            # 2x2 average pool to halve aux spatial extent (Cellpose is at
+            # 1/8 native resolution; this brings it to 1/16, similar to
+            # DINOv2's 1/14 patch grid).
+            self.aux_pool = nn.AvgPool2d(kernel_size=2, stride=2)
+            # Token-type embeddings: 0 = primary, 1 = auxiliary.
+            self.type_embed = nn.Embedding(2, hidden_dim)
+            self.primary_name = primary_name
+            self.aux_name = aux_name
+
+        self.input_proj = nn.Conv2d(primary_chan, hidden_dim, kernel_size=1)
+        self.pos_embed = PositionEmbeddingSine2D(num_pos_feats=hidden_dim // 2)
+
+    def _set_encoder(self, name: str, module: nn.Module) -> None:
+        # Use a name-specific attribute so existing ResNet/DINOv2 checkpoints
+        # still load (their state_dict keys reference 'resnet'/'dinov2').
+        if name == "resnet18":
+            self.resnet = module
+        elif name in _DINOV2_EMBED_DIMS:
+            self.dinov2 = module
+        elif name == "cellpose":
+            self.cellpose = module
         else:
-            feat = self.dinov2(x)
-        feat = self.input_proj(feat)
-        pos = self.pos_embed(feat)
-        return feat, pos
+            raise ValueError(f"unreachable: {name!r}")
+
+    def _primary_feat(self, x: torch.Tensor) -> torch.Tensor:
+        primary_name = self.primary_name if self.is_dual else self.backbone_name
+        if primary_name == "resnet18":
+            return self.resnet(x)
+        if primary_name in _DINOV2_EMBED_DIMS:
+            return self.dinov2(x)
+        if primary_name == "cellpose":
+            return self.cellpose(x)
+        raise ValueError(f"unreachable: {primary_name!r}")
+
+    def forward(self, x: torch.Tensor):
+        """
+        Single mode → returns (feat, pos), both (B, hidden_dim, Hp, Wp).
+        Dual   mode → returns (tokens, pos_tokens), both (S, B, hidden_dim).
+        """
+        # Primary encoder
+        feat_p = self._primary_feat(x)
+        feat_p = self.input_proj(feat_p)
+        pos_p = self.pos_embed(feat_p)
+
+        if not self.is_dual:
+            return feat_p, pos_p
+
+        # Auxiliary encoder (currently always Cellpose)
+        feat_a = self.cellpose(x)                            # (B, 256, H/8, W/8)
+        feat_a = self.aux_pool(feat_a)                        # (B, 256, H/16, W/16)
+        feat_a = self.input_proj_aux(feat_a)                  # (B, D, h, w)
+        pos_a = self.pos_embed(feat_a)
+
+        # Add type embeddings (broadcast over spatial dims).
+        D = self.hidden_dim
+        type_p = self.type_embed.weight[0].view(1, D, 1, 1)
+        type_a = self.type_embed.weight[1].view(1, D, 1, 1)
+        feat_p = feat_p + type_p
+        feat_a = feat_a + type_a
+
+        # Flatten each to (S, B, D) and concat along token dim.
+        f_p = feat_p.flatten(2).permute(2, 0, 1)              # (S_p, B, D)
+        f_a = feat_a.flatten(2).permute(2, 0, 1)              # (S_a, B, D)
+        p_p = pos_p.flatten(2).permute(2, 0, 1)
+        p_a = pos_a.flatten(2).permute(2, 0, 1)
+
+        tokens = torch.cat([f_p, f_a], dim=0)                 # (S_p + S_a, B, D)
+        pos = torch.cat([p_p, p_a], dim=0)
+        return tokens, pos
 
 
 def build_backbone(

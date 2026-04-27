@@ -108,12 +108,22 @@ class ACTCVAE(nn.Module):
         # image: (B, num_cam, 3, H, W)
         B, N = image.shape[:2]
         flat = image.flatten(0, 1)                                         # (B*N, 3, H, W)
-        feat, pos = self.backbone(flat)                                    # (B*N, D, Hp, Wp)
-        D, Hp, Wp = feat.shape[1:]
-        feat = feat.view(B, N, D, Hp, Wp).permute(0, 2, 1, 3, 4).flatten(2)
-        pos = pos.view(B, N, D, Hp, Wp).permute(0, 2, 1, 3, 4).flatten(2)
-        feat = feat.permute(2, 0, 1).contiguous()                          # (N*Hp*Wp, B, D)
-        pos = pos.permute(2, 0, 1).contiguous()
+        feat, pos = self.backbone(flat)
+        # Single-encoder backbones return 4D (B*N, D, Hp, Wp); dual-encoder
+        # backbones already return pre-flattened tokens (S, B*N, D).
+        if feat.dim() == 4:
+            D, Hp, Wp = feat.shape[1:]
+            feat = feat.view(B, N, D, Hp, Wp).permute(0, 2, 1, 3, 4).flatten(2)
+            pos = pos.view(B, N, D, Hp, Wp).permute(0, 2, 1, 3, 4).flatten(2)
+            feat = feat.permute(2, 0, 1).contiguous()                      # (N*Hp*Wp, B, D)
+            pos = pos.permute(2, 0, 1).contiguous()
+        else:
+            # feat: (S, B*N, D) — multi-camera reshape: each camera contributes
+            # S tokens; concat along the token dimension.
+            S, BN, D = feat.shape
+            if N > 1:
+                feat = feat.view(S, B, N, D).permute(2, 0, 1, 3).reshape(N * S, B, D)
+                pos = pos.view(S, B, N, D).permute(2, 0, 1, 3).reshape(N * S, B, D)
         return feat, pos
 
     # -----------------------------------------------------------------------
