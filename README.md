@@ -268,6 +268,17 @@ Verify GPU is visible:
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu')"
 ```
 
+**Optional (GPU only): install xFormers to silence DINOv2 warnings and get faster attention.**
+DINOv2 prints `UserWarning: xFormers is not available` for SwiGLU / Attention / Block when
+its preferred optimized kernels are missing. The model still runs correctly with the
+PyTorch fallback, but on GPU you can pick up a 5–15% speedup (and reduced VRAM on
+ViT-B/L) by installing xFormers. Skip this on CPU/Mac — there's no benefit.
+
+```bash
+# Match the CUDA version to your torch wheel:
+pip install xformers --index-url https://download.pytorch.org/whl/cu124
+```
+
 ### 6.2 Smoke test (CPU, one batch, no weight downloads)
 
 ```bash
@@ -464,6 +475,7 @@ a local server with full weight loading.
 | Inference jittery between chunks | `OPEN_LOOP_HORIZON` too short | Raise it in `config.py`, or implement temporal aggregation in your ROS2 loop |
 | Robot moves wildly during inference | BGR vs RGB mismatch | Convert your OpenCV-decoded frames to RGB |
 | OOM at default batch size | VRAM tight | `--batch-size 4`, or use `resnet18` instead of DINOv2 |
+| `UserWarning: xFormers is not available (SwiGLU/Attention/Block)` | DINOv2 wants optimized kernels that aren't installed | Harmless — model runs correctly. On GPU, see §[6.1](#61-first-time-setup) for the optional xFormers install. |
 
 ### 10.2 Key hyperparameters
 
