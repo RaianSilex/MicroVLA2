@@ -73,7 +73,8 @@ class ACTPolicy(nn.Module):
         logvar: torch.Tensor,
     ) -> dict:
         l1 = F.l1_loss(a_hat, actions, reduction="none")           # (B, k, action_dim)
-        l1 = (l1 * (~is_pad).unsqueeze(-1)).mean()
+        valid = (~is_pad).unsqueeze(-1).float()                    # (B, k, 1)
+        l1 = (l1 * valid).sum() / (valid.sum().clamp_min(1.0) * actions.size(-1))
 
         kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=-1).mean()
 

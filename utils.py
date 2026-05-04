@@ -41,9 +41,12 @@ def save_checkpoint(
     policy: torch.nn.Module,
     optimizer: Optional[torch.optim.Optimizer] = None,
     epoch: Optional[int] = None,
+    best_val: Optional[float] = None,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     ckpt = {"policy": policy.state_dict(), "epoch": epoch}
+    if best_val is not None:
+        ckpt["best_val"] = float(best_val)
     if optimizer is not None:
         ckpt["optimizer"] = optimizer.state_dict()
     torch.save(ckpt, path)

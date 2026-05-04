@@ -14,6 +14,8 @@ import sys
 import threading
 from pathlib import Path
 
+from config import config as C
+
 
 def clamp(v: float, lo: float, hi: float) -> float:
     """Clamp a scalar, accepting bounds in either order."""
@@ -72,8 +74,10 @@ class RolloutArgs:
 
     # Rollout loop.
     max_timesteps: int = 600
-    open_loop_horizon: int = 8
-    control_hz: float = 5.0
+    open_loop_horizon: int = C.OPEN_LOOP_HORIZON
+    control_hz: float = C.CONTROL_HZ
+    temporal_agg: bool = C.TEMPORAL_AGG
+    temporal_agg_k: float = C.TEMPORAL_AGG_K
     dry_run: bool = False
 
     # Robot params.
@@ -111,6 +115,21 @@ def parse_args() -> RolloutArgs:
     p.add_argument("--max-timesteps", type=int, default=RolloutArgs.max_timesteps)
     p.add_argument("--open-loop-horizon", type=int, default=RolloutArgs.open_loop_horizon)
     p.add_argument("--control-hz", type=float, default=RolloutArgs.control_hz)
+    temporal_group = p.add_mutually_exclusive_group()
+    temporal_group.add_argument(
+        "--temporal-agg",
+        dest="temporal_agg",
+        action="store_true",
+        help="Enable ACT-style temporal aggregation.",
+    )
+    temporal_group.add_argument(
+        "--no-temporal-agg",
+        dest="temporal_agg",
+        action="store_false",
+        help="Disable ACT-style temporal aggregation and use open-loop chunks instead.",
+    )
+    p.set_defaults(temporal_agg=RolloutArgs.temporal_agg)
+    p.add_argument("--temporal-agg-k", type=float, default=RolloutArgs.temporal_agg_k)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--default-speed", type=int, default=RolloutArgs.default_speed)
     p.add_argument("--no-ema-smoothing", dest="use_ema_smoothing", action="store_false")
@@ -125,4 +144,3 @@ def parse_args() -> RolloutArgs:
     p.add_argument("--debug-every", type=int, default=RolloutArgs.debug_every)
     ns = p.parse_args()
     return RolloutArgs(**vars(ns))
-

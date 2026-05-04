@@ -152,6 +152,32 @@ def _fmt8(v: np.ndarray) -> str:
     )
 
 
+def _validate_action_chunk(chunk: np.ndarray) -> np.ndarray:
+    chunk = np.asarray(chunk, dtype=np.float32)
+    if chunk.ndim != 2 or chunk.shape[1] != C.ACTION_DIM:
+        raise RuntimeError(
+            f"Expected action chunk shape (T,{C.ACTION_DIM}), got {chunk.shape}"
+        )
+    return chunk
+
+
+def _aggregate_temporal_action(chunk_history, t: int, k: float) -> np.ndarray:
+    actions = []
+    ages = []
+    for start_t, chunk in chunk_history:
+        age = t - start_t
+        if 0 <= age < chunk.shape[0]:
+            actions.append(chunk[age])
+            ages.append(age)
+
+    if not actions:
+        raise RuntimeError("Temporal aggregation has no valid action for this tick")
+
+    weights = np.exp(-float(k) * np.asarray(ages, dtype=np.float32))
+    weights = weights / weights.sum()
+    return (np.stack(actions, axis=0) * weights[:, None]).sum(axis=0).astype(np.float32)
+
+
 def _get_env_cls():
     try:
         from .sensapex_env import SensapexEnv
@@ -165,6 +191,8 @@ def main(args: RolloutArgs) -> None:
         raise ValueError("--open-loop-horizon must be >= 1")
     if args.control_hz <= 0:
         raise ValueError("--control-hz must be > 0")
+    if args.temporal_agg_k < 0:
+        raise ValueError("--temporal-agg-k must be >= 0")
     if not (0.0 < args.ema_alpha <= 1.0):
         raise ValueError("--ema-alpha must be in (0, 1]")
 
@@ -182,6 +210,10 @@ def main(args: RolloutArgs) -> None:
     print("Running MicroACT rollout...")
     print("  - Press Ctrl+C to stop early")
     print("  - Type 'q' + Enter to E-STOP and hold current position")
+    if args.temporal_agg:
+        print("  - Temporal aggregation enabled: re-inferring every tick")
+    else:
+        print(f"  - Open-loop chunks: consuming {args.open_loop_horizon} actions per inference")
     if args.dry_run:
         print("  - DRY RUN: commands will be printed but not published")
 
@@ -190,6 +222,7 @@ def main(args: RolloutArgs) -> None:
     actions_completed_in_chunk = 0
     max_actions_from_current_chunk = 0
     pred_action_chunk = None
+    chunk_history = []
     ema_action = None
 
     try:
@@ -208,24 +241,31 @@ def main(args: RolloutArgs) -> None:
             img = obs.image_rgb
             state = obs.state.astype(np.float32)
 
-            need_new_chunk = (
-                pred_action_chunk is None
-                or actions_completed_in_chunk >= max_actions_from_current_chunk
-            )
-            if need_new_chunk:
-                pred_action_chunk = np.asarray(policy.inference(img, state), dtype=np.float32)
-                if pred_action_chunk.ndim != 2 or pred_action_chunk.shape[1] != C.ACTION_DIM:
-                    raise RuntimeError(
-                        f"Expected action chunk shape (T,{C.ACTION_DIM}), "
-                        f"got {pred_action_chunk.shape}"
-                    )
-                actions_completed_in_chunk = 0
-                max_actions_from_current_chunk = min(
-                    int(args.open_loop_horizon), int(pred_action_chunk.shape[0])
+            if args.temporal_agg:
+                pred_action_chunk = _validate_action_chunk(policy.inference(img, state))
+                chunk_history.append((t, pred_action_chunk))
+                chunk_history = [
+                    (start_t, chunk)
+                    for start_t, chunk in chunk_history
+                    if 0 <= t - start_t < chunk.shape[0]
+                ]
+                action = _aggregate_temporal_action(
+                    chunk_history, t, args.temporal_agg_k
                 )
+            else:
+                need_new_chunk = (
+                    pred_action_chunk is None
+                    or actions_completed_in_chunk >= max_actions_from_current_chunk
+                )
+                if need_new_chunk:
+                    pred_action_chunk = _validate_action_chunk(policy.inference(img, state))
+                    actions_completed_in_chunk = 0
+                    max_actions_from_current_chunk = min(
+                        int(args.open_loop_horizon), int(pred_action_chunk.shape[0])
+                    )
 
-            action = pred_action_chunk[actions_completed_in_chunk]
-            actions_completed_in_chunk += 1
+                action = pred_action_chunk[actions_completed_in_chunk]
+                actions_completed_in_chunk += 1
 
             action = clamp_action_8d(action)
             action = limit_step(state, action)

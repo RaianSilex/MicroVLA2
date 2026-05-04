@@ -313,11 +313,11 @@ moments).
 | `checkpoints/policy_last.pt` | Every epoch |
 | `checkpoints/policy_best.pt` | Whenever val loss improves |
 | `checkpoints/policy_epochN.pt` | Every `--save-every` epochs |
-| `checkpoints/dataset_stats.pkl` | Once at the start of each run |
+| `checkpoints/dataset_stats.pkl` | Once at the start of each run, under the active `--ckpt-dir` |
 
 **Plan disk accordingly** — over 2000 epochs with `--save-every 100`, expect
-~22 GB total. Use `--ckpt-dir /mnt/data/microact_ckpts` to point at a roomier
-filesystem.
+~22 GB total. Use `--ckpt-dir /mnt/data/microact_ckpts` to point checkpoints
+and `dataset_stats.pkl` at a roomier filesystem.
 
 If `train.py` exits with status 1 and no log line, the most likely cause is
 disk-out-of-space during a checkpoint write.
@@ -328,7 +328,8 @@ disk-out-of-space during a checkpoint write.
 python train.py --resume checkpoints/policy_last.pt
 ```
 
-Restores model weights, optimizer state, and the epoch counter exactly.
+Restores model weights, optimizer state, epoch counter, and best validation
+loss tracking.
 
 ### 6.6 Switching backbones
 
@@ -369,7 +370,7 @@ python train.py --val-by-trial --val-split 0.2   # holds out whole trials
 | `--val-by-trial` | off | Split val by whole trials instead of timesteps. Use only with ≥10 trials. |
 | `--num-workers` | `4` | DataLoader subprocesses. Set to `0` for debugging. |
 | `--save-every` | `100` | Numbered checkpoint frequency. |
-| `--ckpt-dir` | `checkpoints/` | Where to write all checkpoint files. |
+| `--ckpt-dir` | `checkpoints/` | Where to write checkpoint files and `dataset_stats.pkl`. |
 | `--resume` | none | Path to a checkpoint to resume from. |
 | `--no-pretrained` | off | Skip ImageNet ResNet18 download (no effect on DINOv2/Cellpose, which always pretrained). |
 | `--backbone` | `resnet18` | See §[4.2](#42-backbone-variants). Single: `resnet18`, `dinov2_vits14/b14/l14`, `cellpose`. Dual: `dinov2_vits14+cellpose`, `resnet18+cellpose`. |
@@ -491,8 +492,11 @@ During a real rollout:
 | `--stats-path` | `checkpoints/dataset_stats.pkl` | Dataset normalization stats. Falls back to stats stored in checkpoint if absent. |
 | `--backbone` | `resnet18` | Must match the backbone used for the checkpoint. |
 | `--device` | `cuda` | Torch device. Falls back to CPU if CUDA is unavailable. |
-| `--open-loop-horizon` | `8` | Number of actions consumed from each predicted chunk before re-inferring. |
+| `--open-loop-horizon` | `8` | Number of actions consumed from each predicted chunk before re-inferring when temporal aggregation is disabled. |
 | `--control-hz` | `5.0` | Rollout control frequency. Match the data collection/training rate when possible. |
+| `--temporal-agg` | follows `TEMPORAL_AGG` | Enable ACT-style temporal aggregation. |
+| `--no-temporal-agg` | off | Disable ACT-style temporal aggregation and use open-loop chunk execution. |
+| `--temporal-agg-k` | `0.01` | Exponential age penalty for temporal aggregation. Larger values favor newer chunks more strongly. |
 | `--default-speed` | `100` | Speed appended to each `/ump/target` and `/ump2/target` message. |
 | `--no-ema-smoothing` | off | Disable first-order smoothing on commanded targets. |
 | `--ema-alpha` | `0.35` | EMA coefficient. `1.0` means no smoothing; smaller values smooth more. |
@@ -516,9 +520,11 @@ During a real rollout:
 Each control tick does:
 
 1. Read the latest camera frame and 8-D Sensapex state from ROS.
-2. If the current action chunk is exhausted, call
-   `ACTPolicy.inference(image_rgb, state_8d)`.
-3. Take the next action from the chunk.
+2. With temporal aggregation enabled, call
+   `ACTPolicy.inference(image_rgb, state_8d)` every tick, keep recent chunks,
+   and exponentially average all predictions that target the current tick.
+3. With `--no-temporal-agg`, call inference only when the current open-loop
+   chunk is exhausted and take the next action from that chunk.
 4. Clamp it to the configured per-axis workspace bounds.
 5. Limit each axis' single-tick delta relative to the current measured state.
 6. Optionally apply EMA smoothing.
@@ -567,7 +573,7 @@ a local server with full weight loading.
 | KL → 0 within a few epochs | Style encoder being ignored | Lower `KL_WEIGHT` to 1.0 or 0.1 in `config.py` |
 | KL > 50 | Latent too expressive | Lower `LATENT_DIM` or raise `KL_WEIGHT` |
 | Val loss "looks great" but robot fails | Random val split leaks across trials | Use `--val-by-trial` (needs ≥10 trials) |
-| Inference jittery between chunks | `OPEN_LOOP_HORIZON` too short | Raise it in `config.py`, or implement temporal aggregation in your ROS2 loop |
+| Inference jittery between chunks | Open-loop execution or smoothing too weak | Keep temporal aggregation enabled, lower `--temporal-agg-k`, lower `--ema-alpha`, or raise `--open-loop-horizon` when using `--no-temporal-agg` |
 | Robot moves wildly during inference | BGR vs RGB mismatch | Convert your OpenCV-decoded frames to RGB |
 | OOM at default batch size | VRAM tight | `--batch-size 4`, or use `resnet18` instead of DINOv2 |
 | `UserWarning: xFormers is not available (SwiGLU/Attention/Block)` | DINOv2 wants optimized kernels that aren't installed | Harmless — model runs correctly. On GPU, see §[6.1](#61-first-time-setup) for the optional xFormers install. |
@@ -583,6 +589,7 @@ Edit in `config/config.py`:
 | `ENC_LAYERS` / `DEC_LAYERS` | 4 / 7 | Reduce to 3 / 4 for faster training on small datasets. |
 | `KL_WEIGHT` | 10 | Beta on KL term. Tune if KL collapses or explodes. |
 | `OPEN_LOOP_HORIZON` | 8 | How many actions to execute per inference at deployment. |
+| `TEMPORAL_AGG` / `TEMPORAL_AGG_K` | `True` / `0.01` | Defaults for ACT-style temporal aggregation in `rollout/main.py`. |
 | `BACKBONE` | `"resnet18"` | Defaults; override per-run with `--backbone`. |
 
 ### 10.3 Adding new control modalities
@@ -601,9 +608,21 @@ Out of scope for the current release.
 ### 10.4 Rollout: temporal aggregation
 
 The ACT paper averages overlapping chunk predictions with an exponential weight to
-smooth jitter. If you want this on, set `TEMPORAL_AGG = True` and
-`TEMPORAL_AGG_K = 0.01` in `config.py` and implement the averaging in your rollout
-loop. Not implemented in MicroACT itself — config flags are placeholders.
+smooth jitter. `rollout/main.py` implements this by re-inferring every control
+tick, storing recent action chunks, and averaging the predictions that point at
+the current tick with weights:
+
+```
+weight(age) = exp(-TEMPORAL_AGG_K * age)
+```
+
+Temporal aggregation is on by default. Disable it with:
+
+```bash
+python3 -m rollout.main --no-temporal-agg
+```
+
+Use `--temporal-agg-k` to tune how quickly older chunks lose influence.
 
 ---
 

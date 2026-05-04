@@ -28,8 +28,8 @@ Dual-encoder paths run both encoders independently, project each to
 `hidden_dim`, add a per-encoder type embedding, position-embed each in
 its own normalized coordinate frame, then concatenate along the token
 sequence. Cellpose features are 2x2-avg-pooled before flattening to
-keep the token budget reasonable (240x320 → 7x10 = 70 tokens for
-Cellpose, vs 17x23 = 391 for DINOv2).
+keep the token budget reasonable (240x320 -> 30x40 -> 15x20 = 300
+Cellpose tokens, vs 238x308 -> 17x22 = 374 DINOv2 tokens).
 
 Multi-camera handling (concatenation along spatial dim, per-camera pos
 offsets, etc.) lives in the CVAE module, not here.
@@ -118,8 +118,8 @@ class DinoV2Backbone(nn.Module):
 
     The model expects spatial dims divisible by the patch size (14). We
     bilinearly resize on the fly, so the rest of the pipeline is free to
-    use any image shape (we currently use 240x320 → resized to 238x322 =
-    17x23 patches).
+    use any image shape (we currently use 240x320 -> resized to 238x308 =
+    17x22 patches).
     """
 
     def __init__(self, name: str = "dinov2_vits14", freeze: bool = True):

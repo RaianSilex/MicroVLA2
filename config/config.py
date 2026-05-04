@@ -65,5 +65,5 @@ DEVICE = "cuda"
 # ---------- Rollout ----------
 OPEN_LOOP_HORIZON = 8       # actions consumed per inference during rollout
 CONTROL_HZ = 5.0            # matches logger_node default log_interval_ms = 200
-TEMPORAL_AGG = True         # ACT-style exponential ensembling across chunks
+TEMPORAL_AGG = True         # ACT-style exponential ensembling in rollout/main.py
 TEMPORAL_AGG_K = 0.01

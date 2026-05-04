@@ -94,7 +94,8 @@ def main() -> None:
         device = "cpu"
 
     # ---- Data ----
-    full_ds = build_dataset(recompute_stats=True)
+    stats_path = args.ckpt_dir / "dataset_stats.pkl"
+    full_ds = build_dataset(stats_path=stats_path, recompute_stats=True)
 
     if args.val_by_trial:
         n_trials = len(full_ds.trials)
@@ -143,15 +144,27 @@ def main() -> None:
           f"(frozen={not args.unfreeze_backbone if args.backbone != 'resnet18' else False})")
     optimizer = build_optimizer(policy, args.lr, args.lr_backbone, args.weight_decay)
 
-    start_epoch = 0
-    best_val = float("inf")
-    if args.resume is not None and args.resume.exists():
-        start_epoch = load_checkpoint(args.resume, policy, optimizer, map_location=device)
-        print(f"resumed from {args.resume} at epoch {start_epoch}")
-
     # ---- Loop ----
     ckpt_last = args.ckpt_dir / "policy_last.pt"
     ckpt_best = args.ckpt_dir / "policy_best.pt"
+
+    start_epoch = 0
+    best_val = float("inf")
+    if args.resume is not None and args.resume.exists():
+        resume_ckpt = torch.load(args.resume, map_location=device)
+        start_epoch = load_checkpoint(args.resume, policy, optimizer, map_location=device)
+        best_val = resume_ckpt.get("best_val", best_val)
+
+        if best_val == float("inf") and ckpt_best.exists():
+            print(f"[resume] best_val missing; evaluating existing {ckpt_best}")
+            load_checkpoint(ckpt_best, policy, map_location=device)
+            best_val = run_epoch(policy, val_loader, optimizer, device, train=False)["loss"].avg
+            load_checkpoint(args.resume, policy, optimizer, map_location=device)
+        elif best_val == float("inf"):
+            print("[resume] best_val missing; initializing from resumed model val loss")
+            best_val = run_epoch(policy, val_loader, optimizer, device, train=False)["loss"].avg
+
+        print(f"resumed from {args.resume} at epoch {start_epoch}; best_val={best_val:.4f}")
 
     for epoch in range(start_epoch, args.epochs):
         tr = run_epoch(policy, train_loader, optimizer, device, train=True)
@@ -162,15 +175,17 @@ def main() -> None:
             f"train {format_meters(tr)}  |  val {format_meters(vl)}"
         )
 
-        save_checkpoint(ckpt_last, policy, optimizer, epoch + 1)
-        if vl["loss"].avg < best_val:
-            best_val = vl["loss"].avg
-            save_checkpoint(ckpt_best, policy, optimizer, epoch + 1)
+        val_loss = vl["loss"].avg
+        if val_loss < best_val:
+            best_val = val_loss
+            save_checkpoint(ckpt_best, policy, optimizer, epoch + 1, best_val=best_val)
+
+        save_checkpoint(ckpt_last, policy, optimizer, epoch + 1, best_val=best_val)
 
         if (epoch + 1) % args.save_every == 0:
             save_checkpoint(
                 args.ckpt_dir / f"policy_epoch{epoch+1}.pt",
-                policy, optimizer, epoch + 1,
+                policy, optimizer, epoch + 1, best_val=best_val,
             )
 
     print(f"done. best val loss: {best_val:.4f}")
