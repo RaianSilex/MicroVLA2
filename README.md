@@ -338,7 +338,7 @@ python train.py --backbone dinov2_vits14+cellpose
 python train.py --backbone resnet18 --no-pretrained         # offline / smoke-test
 ```
 
-Backbones produce checkpoints with different shapes — you can't load a
+Backbones produce checkpoints with different shapes as you can't load a
 ResNet18 checkpoint into a DINOv2 model. Switching = retrain from scratch.
 
 ### 6.7 Validation split
@@ -379,59 +379,154 @@ python train.py --val-by-trial --val-split 0.2   # holds out whole trials
 
 ## 8. Inference (ROS2 Integration)
 
-This codebase ends at `ACTPolicy.inference(image_np, qpos_np)`. The closed-loop
-rollout (camera/state subscribers, target publishers, E-stop, safety clamping)
-should live in your existing `ump_suite` ROS2 package.
+MicroACT now includes local robot-side rollout scripts under `rollout/`.
 
-### 8.1 The inference call
+The rollout state/action vector is **8-D**:
 
-```python
-from model.act_policy import build_policy
-from utils import load_checkpoint
-import torch
-
-# Build a policy with stats from the checkpoint dir, load weights.
-policy = build_policy(stats_path="checkpoints/dataset_stats.pkl",
-                      backbone_name="dinov2_vits14+cellpose").eval()
-load_checkpoint("checkpoints/policy_best.pt", policy, map_location="cuda")
-policy = policy.to("cuda")
-
-# At each rollout tick:
-image_np = ...                          # (H, W, 3) uint8 RGB — ensure RGB, not BGR
-qpos_np = ...                           # (8,) float, raw centered Sensapex counts
-action_chunk = policy.inference(image_np, qpos_np)   # (100, 8) float32 absolute targets
+```
+[x1, y1, z1, d1, x2, y2, z2, d2]
 ```
 
-### 8.2 Open-loop rollout pattern
+There is no ODrive / focus-motor ninth dimension in this MicroACT policy.
 
-```python
-chunk = None
-chunk_idx = 0
-period = 1.0 / 5.0          # match training control rate
+### 8.1 Files
 
-for t in range(max_timesteps):
-    if estop.is_set():
-        env.hold(); break
-
-    obs = env.get_observation()
-    if chunk is None or chunk_idx >= OPEN_LOOP_HORIZON:
-        chunk = policy.inference(obs.image_rgb, obs.state[:8])
-        chunk_idx = 0
-
-    target = clamp_action_8d(chunk[chunk_idx])     # your safety clamp
-    env.step_absolute(target)
-    chunk_idx += 1
-    time.sleep(period)
-```
-
-### 8.3 Things you must add on the ROS2 side
-
-| Concern | Fix |
+| File | Purpose |
 |---|---|
-| **BGR vs RGB** | If your camera node decodes JPEGs with OpenCV, convert with `cv2.cvtColor(img, cv2.COLOR_BGR2RGB)` before calling `inference`. Training images go through PIL (RGB). |
-| **Safety clamping** | Per-axis position bounds and max step deltas. Your existing rollout loop has these. |
-| **State slicing** | Drop any non-Sensapex state dims (e.g. focus motor encoder) if they're not part of `STATE_DIM=8`. |
-| **Sensapex centered counts** | The policy is trained on the same centered-counts space the rig uses (0 = mid-travel). Don't pre-shift before calling `inference`. |
+| `rollout/main.py` | Main closed-loop rollout. Loads `ACTPolicy`, calls `policy.inference(image_rgb, state_8d)`, consumes action chunks, clamps/step-limits commands, and publishes targets. |
+| `rollout/sensapex_env.py` | ROS2 bridge for camera + two Sensapex stages. Subscribes to live state/image topics and publishes absolute Sensapex targets. |
+| `rollout/rollout.py` | Shared CLI args, scalar clamp helper, Ctrl+C handling helper, and `q` + Enter E-stop listener. |
+
+### 8.2 Environment setup
+
+Run from the MicroACT repo root in a Python environment that can import both
+ROS2 `rclpy` and the MicroACT dependencies (`torch`, `torchvision`, `numpy`,
+`PIL`, etc.).
+
+```bash
+cd /home/raianlaptop/MicroACT
+
+# Source ROS / your workspace first.
+source /opt/ros/humble/setup.bash
+source /home/raianlaptop/ros2_ws/install/setup.bash
+
+# If you use a venv, activate one that still has access to rclpy.
+# Then verify imports:
+python3 -c "import rclpy, torch; print('rclpy + torch OK')"
+```
+
+Before running on hardware, open `rollout/main.py` and verify the workspace
+bounds near the top of the file:
+
+```python
+X1_MIN, X1_MAX = 4600, 5700
+Y1_MIN, Y1_MAX = 4900, 5500
+Z1_MIN, Z1_MAX = 8750, 8250
+D1_MIN, D1_MAX = 5900, 6100
+
+X2_MIN, X2_MAX = 4600, 5700
+Y2_MIN, Y2_MAX = 4900, 5500
+Z2_MIN, Z2_MAX = 8750, 8250
+D2_MIN, D2_MAX = 5900, 6100
+```
+
+Those limits are safety-critical placeholders copied from the previous rollout
+shape. Edit them for the actual workspace before publishing commands.
+
+### 8.3 Run a rollout
+
+The usual command is:
+
+```bash
+python3 -m rollout.main \
+  --checkpoint checkpoints/policy_best.pt \
+  --stats-path checkpoints/dataset_stats.pkl \
+  --backbone resnet18 \
+  --device cuda
+```
+
+For a DINOv2 + Cellpose checkpoint:
+
+```bash
+python3 -m rollout.main \
+  --checkpoint checkpoints/policy_best.pt \
+  --stats-path checkpoints/dataset_stats.pkl \
+  --backbone dinov2_vits14+cellpose \
+  --device cuda
+```
+
+If CUDA is requested but unavailable, the script prints a warning and falls
+back to CPU. If `dataset_stats.pkl` is missing, the script attempts to recover
+normalization stats from the checkpoint buffers.
+
+### 8.4 Dry run and help
+
+Show all rollout flags:
+
+```bash
+python3 -m rollout.main --help
+```
+
+Run the policy and ROS subscribers without publishing target commands:
+
+```bash
+python3 -m rollout.main \
+  --checkpoint checkpoints/policy_best.pt \
+  --backbone resnet18 \
+  --dry-run
+```
+
+During a real rollout:
+
+| Input | Effect |
+|---|---|
+| `Ctrl+C` | Stop the rollout loop early and shut down the ROS node. |
+| `q` + Enter | E-stop path: send one hold-current-position command, then exit. |
+
+### 8.5 Important flags
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--checkpoint` | `checkpoints/policy_best.pt` | Policy checkpoint to load. |
+| `--stats-path` | `checkpoints/dataset_stats.pkl` | Dataset normalization stats. Falls back to stats stored in checkpoint if absent. |
+| `--backbone` | `resnet18` | Must match the backbone used for the checkpoint. |
+| `--device` | `cuda` | Torch device. Falls back to CPU if CUDA is unavailable. |
+| `--open-loop-horizon` | `8` | Number of actions consumed from each predicted chunk before re-inferring. |
+| `--control-hz` | `5.0` | Rollout control frequency. Match the data collection/training rate when possible. |
+| `--default-speed` | `100` | Speed appended to each `/ump/target` and `/ump2/target` message. |
+| `--no-ema-smoothing` | off | Disable first-order smoothing on commanded targets. |
+| `--ema-alpha` | `0.35` | EMA coefficient. `1.0` means no smoothing; smaller values smooth more. |
+| `--dry-run` | off | Compute commands but do not publish them. |
+| `--debug-every` | `10` | Print state/command every N ticks. Use `0` to disable. |
+
+### 8.6 ROS topics used
+
+`rollout/sensapex_env.py` uses these topics:
+
+| Direction | Topic | Message | Meaning |
+|---|---|---|---|
+| Subscribe | `/camera/image/compressed` | `sensor_msgs/CompressedImage` | Microscope RGB image source. Decoded with PIL, so rollout receives RGB. |
+| Subscribe | `/ump/live` | `std_msgs/Int32MultiArray` | Stage 1 live `[x, y, z, d]`. |
+| Subscribe | `/ump2/live` | `std_msgs/Int32MultiArray` | Stage 2 live `[x, y, z, d]`. |
+| Publish | `/ump/target` | `std_msgs/Int32MultiArray` | Stage 1 absolute target `[x, y, z, d, speed]`. |
+| Publish | `/ump2/target` | `std_msgs/Int32MultiArray` | Stage 2 absolute target `[x, y, z, d, speed]`. |
+
+### 8.7 Rollout logic
+
+Each control tick does:
+
+1. Read the latest camera frame and 8-D Sensapex state from ROS.
+2. If the current action chunk is exhausted, call
+   `ACTPolicy.inference(image_rgb, state_8d)`.
+3. Take the next action from the chunk.
+4. Clamp it to the configured per-axis workspace bounds.
+5. Limit each axis' single-tick delta relative to the current measured state.
+6. Optionally apply EMA smoothing.
+7. Publish absolute targets to `/ump/target` and `/ump2/target`.
+
+The policy expects RGB images and raw centered Sensapex counts. Do not add the
+OpenPI ODrive ninth dimension, and do not pre-shift coordinates before calling
+MicroACT.
 
 ---
 
