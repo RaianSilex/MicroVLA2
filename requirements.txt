@@ -3,6 +3,7 @@ torchvision>=0.15
 numpy>=1.24,<2
 pandas>=2.0
 pillow>=10.0
+transformers>=4.40
 # Optional — only needed for backbones that include "+cellpose".
 # Pin to 3.x for the lighter U-Net architecture (Cellpose 4 is a 304M-param
 # SAM-ViT). The numba dependency that breaks on import is bypassed: we

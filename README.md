@@ -19,6 +19,7 @@ microscope camera. Trains a visuomotor policy from teleoperated demonstrations.
 9. [Visualizing the Architecture](#9-visualizing-the-architecture)
 10. [Tuning Notes & Gotchas](#10-tuning-notes--gotchas)
 11. [Glossary](#11-glossary)
+12. [MicroVLA Pipeline](#12-microvla-pipeline)
 
 ---
 
@@ -640,3 +641,158 @@ Use `--temporal-agg-k` to tune how quickly older chunks lose influence.
 | **Sensapex centered counts** | Symmetric-around-zero integer position units (0 = middle of travel). |
 | **Style encoder** | The CVAE encoder that produces `(μ, log σ²)` from a demo's `(qpos, actions)`. Used during training only. |
 | **Temporal aggregation** | Averaging predictions from overlapping chunks at deployment to reduce jitter. |
+
+---
+
+## 12. MicroVLA Pipeline
+
+MicroVLA is a parallel vision-language-action stack built on top of the same
+ACT action-chunking idea. The original MicroACT files remain usable for the
+fixed dual-Sensapex 8-D policy. The VLA path adds:
+
+| File | Purpose |
+|---|---|
+| `config/vla_config.py` | Shared VLA dimensions, default DINOv2+Cellpose backbone, text model, paths, and rollout defaults. |
+| `data/vla_dataset.py` | Metadata-driven heterogeneous episode loader with padded state/action tensors and masks. |
+| `model/language_encoder.py` | Frozen Hugging Face text encoder by default, plus a simple offline smoke-test encoder. |
+| `model/embodiment.py` | Learned robot/lab/embodiment/action/task metadata tokens. |
+| `model/vla_cvae.py` | ACT-style CVAE conditioned on image, language, state, and embodiment tokens. |
+| `model/vla_policy.py` | Masked heterogeneous loss and raw-unit VLA inference helper. |
+| `model/finetune.py` | Helpers for adapting a pretrained checkpoint to new data: vocab extension, per-robot stats merging, partial state-dict loading, selective freezing, and LoRA on transformer FFN linears. |
+| `train_vla.py` | VLA training entry point with episode-level validation, optional lab/robot holdouts, and `--finetune` mode. |
+| `rollout/vla_main.py` | Adapter-based VLA rollout entry point. |
+| `rollout/adapters/sensapex_dual.py` | First robot adapter: current dual-Sensapex ROS2 setup. |
+
+### 12.1 Dataset layout
+
+Put VLA episodes under:
+
+```text
+dataset_vla/episodes/<episode_id>/
+├── metadata.json
+├── trajectory.csv
+└── frames/cam_main/frame_000000.png
+```
+
+Each `metadata.json` declares the robot/lab/task metadata, language instruction,
+state/action dimensions, and the CSV column names for that episode. Single-arm
+robots can use `state_dim=4` / `action_dim=4`; the loader pads to
+`MAX_STATE_DIM=16` and `MAX_ACTION_DIM=16` and masks invalid dimensions.
+
+See `dataset_vla/README.md` for a minimal metadata example.
+
+### 12.2 Train VLA
+
+```bash
+python train_vla.py \
+  --backbone dinov2_vits14+cellpose \
+  --language-backend hf \
+  --text-model distilbert-base-uncased
+```
+
+For offline smoke tests without downloading a text model:
+
+```bash
+python train_vla.py --language-backend simple --backbone resnet18 --no-pretrained
+```
+
+Use whole-lab or whole-robot validation holdouts when you have enough data:
+
+```bash
+python train_vla.py --holdout-lab lab_b
+python train_vla.py --holdout-robot sensapex_single_ump4
+```
+
+### 12.3 Rollout VLA on the current rig
+
+```bash
+python3 -m rollout.vla_main \
+  --checkpoint checkpoints_vla/vla_policy_best.pt \
+  --adapter sensapex_dual \
+  --instruction "move both manipulators toward the selected cell"
+```
+
+The VLA rollout uses the checkpoint's saved backbone/language settings by
+default. The Sensapex adapter still applies workspace clamping, per-tick step
+limits, optional EMA smoothing, and publishes only the 8-D dual-Sensapex target
+shape expected by the current ROS2 rig.
+
+### 12.4 Pretrain → finetune workflow
+
+A pretrained MicroVLA checkpoint can be handed to a downstream user who then
+adapts it to their own rig, instructions, or task variants on a much smaller
+dataset. The flow is built into `train_vla.py` via `--finetune <ckpt>`.
+
+**What pretraining produces.** Standard `python train_vla.py …` with no
+finetune flags writes a vanilla checkpoint — no LoRA wrappers, no extra
+freezing — at `checkpoints_vla/vla_policy_best.pt`. This is exactly what
+inference and downstream finetuning expect.
+
+**Finetune on new data.** The downstream user runs:
+
+```bash
+python train_vla.py \
+  --episodes-dir /path/to/their/episodes \
+  --finetune checkpoints_vla/your_pretrained.pt \
+  --freeze-mode trunk \
+  --lora-r 8 --lora-alpha 16 \
+  --epochs 200 --batch-size 8 --lr 5e-5
+```
+
+Under the hood:
+
+1. **Vocab extension** — `extend_vocabs` appends any new robot / lab /
+   embodiment / action-type / task-family names to the pretrained vocabs.
+   Old IDs are preserved verbatim so trained embedding rows still mean
+   what they meant during pretraining.
+2. **Stats merging** — `merge_stats` keeps the pretrained per-robot
+   normalization for robots only seen during pretraining and uses the new
+   dataset's stats for shared robots.
+3. **Partial state-dict load** — `load_finetune_state_dict` copies
+   exactly-matching tensors directly and corner-copies grown tensors
+   (e.g. an embedding table that gained rows). The per-robot stat tables
+   are skipped during load so the merged stats stay in place.
+4. **Optional freezing** — `--freeze-mode trunk` freezes the main
+   transformer + style encoder; `head_only` additionally freezes the
+   backbones, language encoder, projections, and most embeddings,
+   leaving only metadata embeddings + action head trainable.
+5. **Optional LoRA** — `--lora-r 8` wraps the FFN `linear1` / `linear2`
+   modules in transformer + style encoder with low-rank adapters. The
+   base weights stay frozen; only the rank-r `A` and `B` matrices train.
+
+**Resume a finetune run.** `--resume <ckpt>` rebuilds the prior
+architecture (including freeze mode + LoRA settings) from the checkpoint's
+saved config before loading weights. `--resume` wins if both `--resume`
+and `--finetune` are passed.
+
+#### Recommended finetune recipes
+
+| Dataset size | Recommended flags |
+|---|---|
+| 50–200 demos, new rig in same robot family | `--freeze-mode trunk --lora-r 8 --lora-alpha 16 --lr 5e-5` |
+| 500–2000 demos, varied conditions | `--freeze-mode none --lr 1e-5` |
+| New robot DOF count | Write a new `rollout/adapters/<name>.py` (~50 lines) with `state_dim` / `action_dim` and rig-specific safety bounds; pretrained model adapts via vocab extension. |
+
+#### Caveats
+
+- **LoRA covers FFN linears only.** `nn.MultiheadAttention` uses a fused
+  QKV weight rather than `nn.Linear`, so QKV LoRA would need a separate
+  replacement module. Not implemented.
+- **Rollout adapters are robot-specific.** The default
+  `SensapexDualAdapter` is hardcoded for the 8-DOF dual-Sensapex rig
+  with workspace bounds in `rollout/main.py`. Different robots need
+  their own adapter — the policy itself is rig-agnostic.
+- **The corner-copy loader handles "grew", not "shrank".** Reducing
+  `chunk_size` or `MAX_ACTION_DIM` between pretrain and finetune skips
+  the affected weights instead of truncating them.
+
+#### `train_vla.py` finetune flags
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--finetune` | none | Pretrained checkpoint to start from. |
+| `--freeze-mode` | `none` | `none` / `trunk` / `head_only`. |
+| `--lora-r` | `0` | LoRA rank. `0` disables LoRA. |
+| `--lora-alpha` | `16.0` | LoRA scaling: effective update is multiplied by `alpha / r`. |
+| `--lora-targets` | `transformer,style_encoder` | Comma-separated submodules under `policy.model` to wrap. |
+| `--lora-dropout` | `0.0` | Dropout applied to the LoRA input. |
