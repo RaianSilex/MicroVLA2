@@ -1,8 +1,9 @@
-# MicroACT
+# MicroVLA
 
 A from-scratch implementation of **ACT** (Action Chunking with Transformers,
 Zhao et al. 2023) for a dual-Sensapex uMp4 micromanipulator rig with one
 microscope camera. Trains a visuomotor policy from teleoperated demonstrations.
+This is combined with a vision-encoder backbone created by DINOv2 + Cellpose 3 (Truncated) along with BERT language encoder to create MicroVLA.
 
 ---
 
