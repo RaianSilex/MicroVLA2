@@ -12,7 +12,8 @@ def add(story):
         "<b>D</b> = HIDDEN_DIM = 512. <b>L_dim</b> = LATENT_DIM = 32.",
         "<b>S_img</b> = number of image tokens. ResNet18: ~ 8&times;10 = 80. "
         "DINOv2 ViT-S/14 at 238&times;308: 17&times;22 = 374. "
-        "Cellpose pooled: 15&times;20 = 300. Dual encoder total: 374 + 300 = 674.",
+        "Cellpose 4 default: about 5&times;7 = 35 aux tokens after diameter scaling. "
+        "DINOv2 + Cellpose 4 total: about 374 + 35 = 409.",
         "<b>L_lang</b> = MAX_LANGUAGE_TOKENS = 32. "
         "<b>L_meta</b> = 5 metadata tokens (robot, lab, embodiment, action_type, task_family).",
         "Transformer code uses sequence-first tensors <b>(L, B, D)</b>. "

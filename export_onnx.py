@@ -8,7 +8,7 @@ Produces two files under `onnx_exports/<backbone>/`:
 
 After running, open https://netron.app in your browser and drag the .onnx files in.
 
-Use `--backbone` to switch between ResNet18 and DINOv2 variants.
+Use `--backbone` to switch between ResNet18, DINOv2, Cellpose, and dual variants.
 """
 
 import argparse
@@ -114,7 +114,8 @@ def main(
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--backbone", type=str, default=None,
-                   help="resnet18 | dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14. "
+                   help="resnet18 | dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14 | "
+                        "cellpose | cellpose4 | <primary>+cellpose[4]. "
                         "Defaults to config.BACKBONE.")
     p.add_argument("--unfreeze-backbone", action="store_true",
                    help="DINOv2 backbones are frozen by default; pass this to include "

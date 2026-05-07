@@ -242,8 +242,9 @@ def build_encoder(d_model=C.HIDDEN_DIM, nhead=C.NHEAD, num_layers=C.ENC_LAYERS,
     h1(story, "model/backbone.py")
     h2(story, "Purpose")
     body(story, "Image feature extractors plus a 2D sinusoidal position embedding and "
-                "a 1x1 projection to <b>hidden_dim = 512</b>. Three single-encoder "
-                "options (ResNet18, DINOv2 ViT-S/B/L, Cellpose 3 cyto3) plus a "
+                "a 1x1 projection to <b>hidden_dim = 512</b>. Single-encoder "
+                "options include ResNet18, DINOv2 ViT-S/B/L, Cellpose 3 cyto3, "
+                "and Cellpose 4 / Cellpose-SAM, plus a "
                 "dual-encoder fusion mode that concatenates two encoders' tokens "
                 "with a learned per-encoder type embedding.")
     h2(story, "Shape / object contract")
@@ -258,8 +259,12 @@ def build_encoder(d_model=C.HIDDEN_DIM, nhead=C.NHEAD, num_layers=C.ENC_LAYERS,
         "<b>(B, 384, 17, 22)</b> patches &rarr; projected to <b>(B, 512, 17, 22)</b>.",
         "Cellpose at 240x320 input: <b>(B, 256, 30, 40)</b> at 1/8 resolution &rarr; "
         "AvgPool2d(2) &rarr; <b>(B, 256, 15, 20)</b> &rarr; projected to <b>(B, 512, 15, 20)</b>.",
+        "Cellpose 4 with <code>CELLPOSE4_DIAMETER=180</code>: roughly "
+        "<b>(B, 259, 5, 7)</b> before projection, including CP-SAM neck + averaged readout channels.",
         "DINOv2+Cellpose combined token count: 17*22 + 15*20 = 374 + 300 = "
         "<b>674 tokens</b>.",
+        "DINOv2+Cellpose 4 combined token count: approximately 374 + 35 = "
+        "<b>409 tokens</b> with the default diameter scaling.",
     ])
 
     code_block(story, "model/backbone.py:51-57 - DINOv2 dim table", """\
@@ -480,6 +485,9 @@ def _build_single_encoder(name: str, pretrained: bool, freeze: bool):
     if name == "cellpose":
         m = CellposeBackbone(freeze=freeze)
         return m, m.num_channels
+    if name in _CELLPOSE4_NAMES:
+        m = Cellpose4Backbone(freeze=freeze, pretrained=pretrained)
+        return m, m.num_channels
     raise ValueError(...)""")
 
     code_block(story, "model/backbone.py:307-362 - Backbone (single + dual mode)", """\
@@ -513,8 +521,9 @@ class Backbone(nn.Module):
         self.input_proj = nn.Conv2d(primary_chan, hidden_dim, kernel_size=1)
         self.pos_embed = PositionEmbeddingSine2D(num_pos_feats=hidden_dim // 2)""")
     bullets(story, [
-        "<b>backbone_name = \"a+b\"</b> selects the dual-encoder mode. The repo only "
-        "uses <code>dinov2_vits14+cellpose</code> and <code>resnet18+cellpose</code>; "
+        "<b>backbone_name = \"a+b\"</b> selects the dual-encoder mode. The repo supports "
+        "<code>dinov2_vits14+cellpose4</code>, <code>dinov2_vits14+cellpose</code>, "
+        "<code>resnet18+cellpose4</code>, and <code>resnet18+cellpose</code>; "
         "the code rejects more than 2 parts.",
         "<b>1x1 Conv2d</b> is the projection that maps native channels (512 for "
         "ResNet, 384 for DINOv2-S, 256 for Cellpose) to <code>hidden_dim = 512</code>. "
@@ -522,8 +531,8 @@ class Backbone(nn.Module):
         "<b>type_embed = nn.Embedding(2, 512)</b>: a two-row lookup giving each "
         "encoder a learned 512-D \"this token came from primary/aux\" tag. Added to "
         "tokens before concatenation so attention can route.",
-        "<b>aux_pool = AvgPool2d(2,2)</b> halves the Cellpose grid — 30x40 &rarr; "
-        "15x20 — which keeps the dual-encoder token total around 674.",
+        "<b>aux_pool = AvgPool2d(2,2)</b> halves large Cellpose grids — 30x40 &rarr; "
+        "15x20 — while already-small Cellpose 4 diameter-scaled grids skip pooling.",
     ])
 
     code_block(story, "model/backbone.py:386-420 - Backbone.forward", """\
@@ -535,10 +544,11 @@ def forward(self, x: torch.Tensor):
     if not self.is_dual:
         return feat_p, pos_p                          # 4D pair
 
-    feat_a = self.cellpose(x)                         # (B, 256, H/8, W/8) e.g. (B,256,30,40)
-    feat_a = self.aux_pool(feat_a)                    # (B, 256, H/16, W/16) = (B,256,15,20)
-    feat_a = self.input_proj_aux(feat_a)              # (B, D, 15, 20)
-    pos_a = self.pos_embed(feat_a)                    # (B, D, 15, 20)
+    feat_a = self._encoder_feat(self.aux_name, x)     # CP3 or CP4 aux stream
+    if min(feat_a.shape[-2:]) >= 16:
+        feat_a = self.aux_pool(feat_a)                # halve large aux grids
+    feat_a = self.input_proj_aux(feat_a)              # (B, D, ha, wa)
+    pos_a = self.pos_embed(feat_a)                    # (B, D, ha, wa)
 
     D = self.hidden_dim
     type_p = self.type_embed.weight[0].view(1, D, 1, 1)
@@ -547,19 +557,19 @@ def forward(self, x: torch.Tensor):
     feat_a = feat_a + type_a
 
     f_p = feat_p.flatten(2).permute(2, 0, 1)          # (Hp*Wp, B, D)
-    f_a = feat_a.flatten(2).permute(2, 0, 1)          # (15*20, B, D)
+    f_a = feat_a.flatten(2).permute(2, 0, 1)          # (ha*wa, B, D)
     p_p = pos_p.flatten(2).permute(2, 0, 1)
     p_a = pos_a.flatten(2).permute(2, 0, 1)
 
-    tokens = torch.cat([f_p, f_a], dim=0)             # (Hp*Wp + 300, B, D)
+    tokens = torch.cat([f_p, f_a], dim=0)             # (Hp*Wp + ha*wa, B, D)
     pos = torch.cat([p_p, p_a], dim=0)
     return tokens, pos""")
     bullets(story, [
         "<b>Single-encoder mode</b> returns 4-D <code>(B, D, Hp, Wp)</code> tensors — "
         "the CVAE then flattens these to sequence-first.",
         "<b>Dual-encoder mode</b> returns sequence-first <code>(S, B, D)</code> "
-        "directly because the primary and aux grids have different spatial sizes "
-        "(17x22 vs 15x20) and cannot be packed into one rectangular tensor.",
+        "directly because the primary and aux grids can have different spatial sizes "
+        "and cannot be packed into one rectangular tensor.",
         "<b>Token type addition</b>: the per-encoder type embedding is broadcast over "
         "spatial dims by reshaping to <code>(1, D, 1, 1)</code> — every spatial "
         "position from the primary encoder gets the same row 0 added; every Cellpose "
@@ -567,8 +577,8 @@ def forward(self, x: torch.Tensor):
         "<b>flatten(2).permute(2,0,1)</b>: <code>(B,D,Hp,Wp) &rarr; (B,D,Hp*Wp) &rarr; "
         "(Hp*Wp, B, D)</code>.",
         "<b>Concat along dim=0</b> stacks primary tokens then aux tokens. Final "
-        "shape: <code>(S_p + S_a, B, D)</code>. For DINOv2-S+Cellpose at 240x320: "
-        "<code>(374 + 300, B, 512) = (674, B, 512)</code>.",
+        "shape: <code>(S_p + S_a, B, D)</code>. For DINOv2-S+Cellpose 4 at 240x320 "
+        "with default diameter scaling: about <code>(374 + 35, B, 512)</code>.",
     ])
 
     # =====================================================================
@@ -731,8 +741,8 @@ def _encode_image(self, image):
         "<b>For ResNet18, B=8, N=1, 240x320</b>: <code>feat (8,512,7,10) &rarr; "
         "(8,512,1,7,10) &rarr; (8,512,1,7,10) [permuted] &rarr; (8,512,70) &rarr; "
         "(70, 8, 512)</code>. S_img = 70.",
-        "<b>For DINOv2-S+Cellpose, B=8</b>: backbone returns <code>(674, 8, 512)</code> "
-        "directly; with N=1 the else-branch is a no-op.",
+        "<b>For DINOv2-S+Cellpose 4, B=8</b>: backbone returns roughly "
+        "<code>(409, 8, 512)</code> directly; with N=1 the else-branch is a no-op.",
     ])
 
     code_block(story, "model/cvae.py:131-159 - forward", """\
@@ -770,7 +780,7 @@ def forward(self, image, qpos, actions=None, is_pad=None):
         "<code>style_qpos_proj</code>. Same input, different mapping.",
         "<b>cat along dim=0 (sequence axis)</b>: <code>(1,B,512) + (1,B,512) + "
         "(S_img,B,512) = (2+S_img, B, 512)</code>. For ResNet18 S_img=70 &rarr; total "
-        "72; for DINOv2+Cellpose S_img=674 &rarr; total 676.",
+        "72; for DINOv2+Cellpose 4 S_img is roughly 409 &rarr; total about 411.",
         "<b>query_embed.weight</b> shape <code>(100, 512)</code> is passed straight "
         "to the transformer; it gets broadcast to <code>(100, B, 512)</code> inside.",
         "<b>hs.transpose(0, 1)</b>: <code>(100, B, 512) &rarr; (B, 100, 512)</code> "

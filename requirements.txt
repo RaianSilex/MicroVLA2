@@ -4,8 +4,8 @@ numpy>=1.24,<2
 pandas>=2.0
 pillow>=10.0
 transformers>=4.40
-# Optional — only needed for backbones that include "+cellpose".
-# Pin to 3.x for the lighter U-Net architecture (Cellpose 4 is a 304M-param
-# SAM-ViT). The numba dependency that breaks on import is bypassed: we
-# import only cellpose.resnet_torch.CPnet, not the full cellpose.models API.
-cellpose>=3.1,<4.0
+# Optional — only needed for backbones that include "cellpose" / "cellpose4".
+# Cellpose 4 provides the Cellpose-SAM (`cpsam`) transformer used by the
+# `cellpose4` backbone. The legacy `cellpose` backbone still imports only
+# cellpose.resnet_torch.CPnet for the lighter Cellpose 3-style U-Net path.
+cellpose>=4.0

@@ -155,7 +155,7 @@ IMAGE_HEIGHT = ACT.IMAGE_HEIGHT
 IMAGE_WIDTH = ACT.IMAGE_WIDTH
 CHUNK_SIZE = ACT.CHUNK_SIZE
 
-DEFAULT_BACKBONE = "dinov2_vits14+cellpose"
+DEFAULT_BACKBONE = "dinov2_vits14+cellpose4"
 DEFAULT_TEXT_MODEL = "distilbert-base-uncased"
 LANGUAGE_BACKEND = "hf"
 SIMPLE_TEXT_VOCAB_SIZE = 8192
@@ -171,8 +171,8 @@ DEFAULT_TASK_FAMILY = "cell_manipulation\"""")
         "<b>MAX_STATE_DIM/MAX_ACTION_DIM = 16</b> sets the upper bound on per-robot "
         "DOF. A single-arm 4-DOF demonstration packs into <code>qpos[:4]</code> with "
         "<code>state_mask[:4] = True</code>; everything past 4 is zero and masked.",
-        "<b>DEFAULT_BACKBONE = \"dinov2_vits14+cellpose\"</b> uses the dual encoder "
-        "(general scene features + cell-aware features) by default for VLA.",
+        "<b>DEFAULT_BACKBONE = \"dinov2_vits14+cellpose4\"</b> uses the dual encoder "
+        "(general scene features + Cellpose-SAM cell-aware features) by default for VLA.",
         "<b>DEFAULT_TEXT_MODEL = \"distilbert-base-uncased\"</b> is a 66M-parameter "
         "frozen text encoder. Hidden size 768, output projected to D=512.",
         "<b>MAX_LANGUAGE_TOKENS = 32</b> caps tokenized instructions; longer ones get "

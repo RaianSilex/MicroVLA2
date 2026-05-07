@@ -49,12 +49,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ckpt-dir",     type=Path,  default=C.CKPT_DIR)
     p.add_argument("--resume",       type=Path,  default=None)
     p.add_argument("--no-pretrained", action="store_true",
-                   help="Disable ImageNet pretrained weights on the backbone.")
+                   help="Disable ImageNet ResNet18 weights and Cellpose 4 cpsam weight loading "
+                        "(DINOv2 still uses torch.hub weights).")
     p.add_argument("--backbone", type=str, default=C.BACKBONE,
-                   help="Image backbone: resnet18 | dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14. "
-                        "DINOv2 variants download from torch.hub on first use.")
+                   help="Image backbone: resnet18 | dinov2_vits14 | dinov2_vitb14 | "
+                        "dinov2_vitl14 | cellpose | cellpose4 | <primary>+cellpose[4]. "
+                        "DINOv2 and Cellpose 4 weights download on first use.")
     p.add_argument("--unfreeze-backbone", action="store_true",
-                   help="DINOv2 backbones are frozen by default. Pass this to fine-tune them.")
+                   help="DINOv2/Cellpose backbones are frozen by default. Pass this to fine-tune them.")
     return p.parse_args()
 
 

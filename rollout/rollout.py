@@ -100,7 +100,12 @@ def parse_args() -> RolloutArgs:
     p = argparse.ArgumentParser(description="Run a MicroACT checkpoint on the Sensapex rig.")
     p.add_argument("--checkpoint", type=Path, default=RolloutArgs.checkpoint)
     p.add_argument("--stats-path", type=Path, default=RolloutArgs.stats_path)
-    p.add_argument("--backbone", type=str, default=RolloutArgs.backbone)
+    p.add_argument(
+        "--backbone",
+        type=str,
+        default=RolloutArgs.backbone,
+        help="Backbone used by the checkpoint, e.g. resnet18 or dinov2_vits14+cellpose4.",
+    )
     p.add_argument("--device", type=str, default=RolloutArgs.device)
     p.add_argument(
         "--pretrained-backbone",

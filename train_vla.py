@@ -42,8 +42,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--save-every", type=int, default=100)
     p.add_argument("--resume", type=Path, default=None)
-    p.add_argument("--backbone", type=str, default=C.DEFAULT_BACKBONE)
-    p.add_argument("--no-pretrained", action="store_true")
+    p.add_argument(
+        "--backbone",
+        type=str,
+        default=C.DEFAULT_BACKBONE,
+        help="Image backbone, e.g. dinov2_vits14+cellpose4, dinov2_vits14+cellpose, or resnet18.",
+    )
+    p.add_argument(
+        "--no-pretrained",
+        action="store_true",
+        help="Disable ImageNet ResNet18 weights and Cellpose 4 cpsam weight loading "
+             "(DINOv2 still uses torch.hub weights).",
+    )
     p.add_argument("--unfreeze-backbone", action="store_true")
     p.add_argument("--language-backend", choices=("hf", "simple"), default=C.LANGUAGE_BACKEND)
     p.add_argument("--text-model", type=str, default=C.DEFAULT_TEXT_MODEL)

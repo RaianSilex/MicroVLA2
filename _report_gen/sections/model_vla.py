@@ -371,9 +371,9 @@ def _encode_image(self, image):
     return feat, pos""")
     bullets(story, [
         "Identical structurally to ACT's <code>_encode_image</code>. The default VLA "
-        "backbone is <code>dinov2_vits14+cellpose</code>, so the dual-encoder branch "
-        "(else) is the active path; output is <code>(674, B, 512)</code> for the "
-        "default 240x320 input.",
+        "backbone is <code>dinov2_vits14+cellpose4</code>, so the dual-encoder branch "
+        "(else) is the active path. With <code>CELLPOSE4_DIAMETER=180</code>, output "
+        "is roughly <code>(409, B, 512)</code> for the default 240x320 input.",
     ])
 
     code_block(story, "model/vla_cvae.py:139-200 - forward", """\
@@ -425,7 +425,8 @@ def forward(self, image, qpos, instructions,
     bullets(story, [
         "<b>Token concatenation order in the source</b>: latent (1) + qpos (1) + "
         "5 metadata + 32 language + S_img image. For the default DINOv2+Cellpose at "
-        "240x320 with 1 camera: <code>2 + 5 + 32 + 674 = 713</code> source tokens.",
+        "240x320 with 1 camera and the default Cellpose 4 diameter scaling: "
+        "<code>2 + 5 + 32 + ~409 = ~448</code> source tokens.",
         "<b>extra_src_pos.weight[: non_image.size(0)]</b> uses Python slicing on the "
         "embedding's <code>.weight</code> tensor — gets the first 39 rows, which is "
         "exactly <code>num_non_image_tokens</code>.",

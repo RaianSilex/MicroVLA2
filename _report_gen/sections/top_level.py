@@ -13,7 +13,7 @@ def add(story):
         "Torch / torchvision give tensors, autograd, model layers, ResNet18, ONNX export.",
         "numpy / pandas / pillow handle CSV parsing and image I/O.",
         "transformers (added for VLA) provides DistilBERT/BERT for the HuggingFace text encoder.",
-        "cellpose is optional; only needed for the <i>+cellpose</i> dual-encoder backbone.",
+        "cellpose is optional; only needed for the <i>cellpose</i>/<i>cellpose4</i> backbones.",
     ])
     code_block(story, "requirements.txt:1-11", """\
 torch>=2.0
@@ -22,17 +22,17 @@ numpy>=1.24,<2
 pandas>=2.0
 pillow>=10.0
 transformers>=4.40
-# Optional - only needed for backbones that include "+cellpose".
-# Pin to 3.x for the lighter U-Net architecture (Cellpose 4 is a 304M-param
-# SAM-ViT). The numba dependency that breaks on import is bypassed: we
-# import only cellpose.resnet_torch.CPnet, not the full cellpose.models API.
-cellpose>=3.1,<4.0""")
+# Optional - only needed for backbones that include "cellpose" / "cellpose4".
+# Cellpose 4 provides the Cellpose-SAM (`cpsam`) transformer used by the
+# `cellpose4` backbone. The legacy `cellpose` backbone still imports only
+# cellpose.resnet_torch.CPnet for the lighter Cellpose 3-style U-Net path.
+cellpose>=4.0""")
     bullets(story, [
         "<b>transformers&gt;=4.40</b> is the new line versus the earlier ACT-only repo. "
         "It is required when <code>--language-backend hf</code> is selected (the default).",
-        "Cellpose is pinned <b>&lt;4.0</b> so the import-only path through "
-        "<code>cellpose.resnet_torch</code> works without dragging in numba via "
-        "<code>cellpose.dynamics</code>.",
+        "Cellpose 4 is required for <code>cellpose4</code>. The legacy "
+        "<code>cellpose</code> path still imports only <code>cellpose.resnet_torch</code> "
+        "for the lighter U-Net-style feature extractor.",
     ])
 
     # ----- .gitignore -----

@@ -53,6 +53,14 @@ KL_WEIGHT = 10.0          # beta on the KL term (ACT paper default)
 BACKBONE = "resnet18"
 BACKBONE_PRETRAINED = True
 
+# Cellpose 4 / Cellpose-SAM defaults. These mirror the settings that worked
+# well on raw microscope frames and are used by the `cellpose4` backbone when
+# it rescales images to the model's canonical 30 px object diameter.
+CELLPOSE4_DIAMETER = 180.0
+CELLPOSE4_CELLPROB_THRESHOLD = -2.0
+CELLPOSE4_FLOW_THRESHOLD = 1.5
+CELLPOSE4_INCLUDE_READOUT = True
+
 # ---------- Training ----------
 BATCH_SIZE = 8
 NUM_EPOCHS = 2000

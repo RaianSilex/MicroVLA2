@@ -10,7 +10,7 @@ Two views are printed:
 
 Output goes to stdout. Pipe to a file if you want to keep it:
     python viz_summary.py > architecture.txt
-    python viz_summary.py --backbone dinov2_vits14 > architecture_dinov2.txt
+    python viz_summary.py --backbone dinov2_vits14+cellpose4 > architecture_dinov2_cp4.txt
 """
 
 import argparse
@@ -65,7 +65,8 @@ def main(depth: int = 1, backbone: str = None) -> None:
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--backbone", type=str, default=None,
-                   help="resnet18 | dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14. "
+                   help="resnet18 | dinov2_vits14 | dinov2_vitb14 | dinov2_vitl14 | "
+                        "cellpose | cellpose4 | <primary>+cellpose[4]. "
                         "Defaults to config.BACKBONE.")
     p.add_argument("--depth", type=int, default=1,
                    help="torchinfo nesting depth. 1 = top-level only, 4+ = inner attention.")

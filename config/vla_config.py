@@ -31,7 +31,7 @@ IMAGE_HEIGHT = ACT.IMAGE_HEIGHT
 IMAGE_WIDTH = ACT.IMAGE_WIDTH
 CHUNK_SIZE = ACT.CHUNK_SIZE
 
-DEFAULT_BACKBONE = "dinov2_vits14+cellpose"
+DEFAULT_BACKBONE = "dinov2_vits14+cellpose4"
 DEFAULT_TEXT_MODEL = "distilbert-base-uncased"
 LANGUAGE_BACKEND = "hf"          # "hf" for frozen Transformers, "simple" for offline smoke tests
 SIMPLE_TEXT_VOCAB_SIZE = 8192

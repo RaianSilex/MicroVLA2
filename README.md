@@ -3,7 +3,9 @@
 A from-scratch implementation of **ACT** (Action Chunking with Transformers,
 Zhao et al. 2023) for a dual-Sensapex uMp4 micromanipulator rig with one
 microscope camera. Trains a visuomotor policy from teleoperated demonstrations.
-This is combined with a vision-encoder backbone created by DINOv2 + Cellpose 3 (Truncated) along with BERT language encoder to create MicroVLA.
+This is combined with a vision-encoder backbone created by DINOv2 + Cellpose
+(Cellpose 3 truncated U-Net or Cellpose 4 / Cellpose-SAM) along with a frozen
+language encoder to create MicroVLA.
 
 ---
 
@@ -50,7 +52,7 @@ are written to `checkpoints/` automatically.
 To use a different backbone, pass `--backbone`:
 
 ```bash
-python train.py --backbone dinov2_vits14+cellpose   # recommended for cell targeting
+python train.py --backbone dinov2_vits14+cellpose4  # strongest cell-aware option
 ```
 
 See [§4.2](#42-backbone-variants) for the full list.
@@ -115,7 +117,7 @@ MicroACT/
 |---|---|
 | `config/config.py` | Single source of truth for shapes, hyperparameters, paths. Change `BACKBONE`, `STATE_DIM`, `IMAGE_HEIGHT`, etc. here — every other file imports from this. |
 | `data/dataset.py` | Loads `trial_N.csv`, resolves image paths (with zero-image fallback for missing frames), builds a flat `(trial, timestep)` index, computes normalization stats, and emits `(image, qpos, action_chunk, is_pad)` tuples. |
-| `model/backbone.py` | Image encoders. Dispatches between `resnet18`, `dinov2_*`, `cellpose`, and dual modes (`<primary>+cellpose`). All produce a unified token sequence for the transformer. |
+| `model/backbone.py` | Image encoders. Dispatches between `resnet18`, `dinov2_*`, `cellpose`, `cellpose4`, and dual modes (`<primary>+cellpose[4]`). All produce a unified token sequence for the transformer. |
 | `model/transformer.py` | DETR-style transformer primitives — encoder/decoder layers, stacks, factory. Sequence-first conventions. |
 | `model/cvae.py` | The actual ACT model. Combines backbone + CVAE style encoder + main encoder-decoder + action head. |
 | `model/act_policy.py` | Thin wrapper around `ACTCVAE` adding (a) training loss with masked L1 + KL, (b) numpy-in/numpy-out `.inference()` for rollout, (c) dataset stats stored as buffers so checkpoints are self-contained. |
@@ -178,11 +180,15 @@ Selected via `--backbone`:
 | `dinov2_vitb14` | DINOv2 ViT-B/14 | 86.6 M | no (frozen) | Slightly stronger; usually overkill |
 | `dinov2_vitl14` | DINOv2 ViT-L/14 | 304 M | no (frozen) | Benchmarking only |
 | `cellpose` | Cellpose 3 cyto3 U-Net encoder | 6.6 M | no (frozen) | Specialist; **only useful as the aux stream** |
-| **`dinov2_vits14+cellpose`** | DINOv2 + Cellpose dual | 28.7 M (frozen) | no | **Recommended for cell-targeting micromanipulation** |
+| `cellpose4` | Cellpose 4 / Cellpose-SAM CP-SAM neck + readout | ~304 M | no (frozen) | Strong cell-aware single stream; heavy |
+| `dinov2_vits14+cellpose` | DINOv2 + Cellpose 3 dual | 28.7 M (frozen) | no | Lighter cell-aware dual stream |
+| **`dinov2_vits14+cellpose4`** | DINOv2 + Cellpose 4 dual | ~326 M (frozen) | no | **Recommended when CP4 works best on your raw frames** |
 | `resnet18+cellpose` | ResNet18 + Cellpose dual | 17.8 M | partial | ResNet trains, Cellpose frozen |
+| `resnet18+cellpose4` | ResNet18 + Cellpose 4 dual | ~315 M | partial | Trainable ResNet + CP-SAM specialist |
 
-DINOv2 weights download from `torch.hub` on first use. Cellpose weights download
-from `cellpose.org` (~25 MB) on first use.
+DINOv2 weights download from `torch.hub` on first use. Cellpose 3 cyto3 weights
+download from `cellpose.org` (~25 MB); Cellpose 4 `cpsam` weights download from
+Hugging Face and are much larger.
 
 ### 4.3 Token counts and step time
 
@@ -191,23 +197,43 @@ from `cellpose.org` (~25 MB) on first use.
 | `resnet18` | 80 | 1.0× (baseline) |
 | `dinov2_vits14` | 374 | ~2× |
 | `dinov2_vits14+cellpose` | 674 | ~2.5–3× |
+| `cellpose4` | ~35 with `CELLPOSE4_DIAMETER=180` | heavy; benchmark locally |
+| `dinov2_vits14+cellpose4` | ~409 with `CELLPOSE4_DIAMETER=180` | heavy; benchmark locally |
 
 DINOv2 produces ~5× more spatial tokens than ResNet18, and the dual encoder
-adds another ~300 from Cellpose. Attention compute scales with sequence length.
+adds another stream from Cellpose. Cellpose 4 is compute-heavy because CP-SAM is
+a SAM-style transformer, even though the default diameter scaling keeps its
+token count small. Attention compute scales with sequence length.
 
-### 4.4 Dual-encoder design (`<primary>+cellpose`)
+### 4.4 Dual-encoder design (`<primary>+cellpose[4]`)
 
-When you use `dinov2_vits14+cellpose` (or `resnet18+cellpose`), the design is:
+When you use `dinov2_vits14+cellpose4`, `dinov2_vits14+cellpose`,
+`resnet18+cellpose4`, or `resnet18+cellpose`, the design is:
 
 | Decision | Choice |
 |---|---|
 | Fusion strategy | Late concatenation along token sequence dimension |
 | Position embeddings | DETR-style 2D sine, normalized to `[0, 2π]` per feature map → grids align approximately at corresponding image positions |
 | Token-type identity | Learned `nn.Embedding(2, hidden_dim)`: index 0 = primary tokens, index 1 = Cellpose tokens |
-| Cellpose token budget | 2×2 avg-pool before flatten (1200 → ~300 tokens) |
+| Cellpose token budget | 2×2 avg-pool before flatten for large aux grids; skipped for already-small Cellpose 4 diameter-scaled grids |
 | Default freeze policy | Both encoders frozen; only the two 1×1 projections + type embed train |
 
 The trainable surface added by the second encoder is ~330 K params — negligible.
+
+Cellpose 4 defaults in `config/config.py` mirror the raw-image settings that
+worked best in manual tests:
+
+```python
+CELLPOSE4_DIAMETER = 180.0
+CELLPOSE4_CELLPROB_THRESHOLD = -2.0
+CELLPOSE4_FLOW_THRESHOLD = 1.5
+```
+
+The backbone uses `CELLPOSE4_DIAMETER` to match Cellpose's canonical scale
+before extracting CP-SAM features. The thresholds are recorded beside the
+backbone because they matter for full mask post-processing, but the training
+path uses CP-SAM feature/readout tensors directly instead of generating masks
+for every batch.
 
 ---
 
@@ -337,6 +363,7 @@ loss tracking.
 
 ```bash
 python train.py --backbone dinov2_vits14
+python train.py --backbone dinov2_vits14+cellpose4
 python train.py --backbone dinov2_vits14+cellpose
 python train.py --backbone resnet18 --no-pretrained         # offline / smoke-test
 ```
@@ -374,8 +401,8 @@ python train.py --val-by-trial --val-split 0.2   # holds out whole trials
 | `--save-every` | `100` | Numbered checkpoint frequency. |
 | `--ckpt-dir` | `checkpoints/` | Where to write checkpoint files and `dataset_stats.pkl`. |
 | `--resume` | none | Path to a checkpoint to resume from. |
-| `--no-pretrained` | off | Skip ImageNet ResNet18 download (no effect on DINOv2/Cellpose, which always pretrained). |
-| `--backbone` | `resnet18` | See §[4.2](#42-backbone-variants). Single: `resnet18`, `dinov2_vits14/b14/l14`, `cellpose`. Dual: `dinov2_vits14+cellpose`, `resnet18+cellpose`. |
+| `--no-pretrained` | off | Skip ImageNet ResNet18 weights and Cellpose 4 `cpsam` weight loading. DINOv2 still downloads through `torch.hub`; legacy `cellpose` still loads cyto3. |
+| `--backbone` | `resnet18` | See §[4.2](#42-backbone-variants). Single: `resnet18`, `dinov2_vits14/b14/l14`, `cellpose`, `cellpose4`. Dual: `dinov2_vits14+cellpose4`, `dinov2_vits14+cellpose`, `resnet18+cellpose4`, `resnet18+cellpose`. |
 | `--unfreeze-backbone` | off | Fine-tune DINOv2/Cellpose. Rarely useful, much slower. No effect on `resnet18`. |
 
 ---
@@ -448,13 +475,13 @@ python3 -m rollout.main \
   --device cuda
 ```
 
-For a DINOv2 + Cellpose checkpoint:
+For a DINOv2 + Cellpose 4 checkpoint:
 
 ```bash
 python3 -m rollout.main \
   --checkpoint checkpoints/policy_best.pt \
   --stats-path checkpoints/dataset_stats.pkl \
-  --backbone dinov2_vits14+cellpose \
+  --backbone dinov2_vits14+cellpose4 \
   --device cuda
 ```
 
@@ -554,9 +581,9 @@ All three accept the same `--backbone` flag and write to per-backbone subdirecto
 ```bash
 pip install torchinfo torchviz       # graphviz system pkg also required for torchviz
 
-python viz_summary.py --backbone dinov2_vits14+cellpose > arch_dual.txt
-python export_onnx.py --backbone dinov2_vits14+cellpose
-python viz_torchviz.py --backbone dinov2_vits14+cellpose
+python viz_summary.py --backbone dinov2_vits14+cellpose4 > arch_dual.txt
+python export_onnx.py --backbone dinov2_vits14+cellpose4
+python viz_torchviz.py --backbone dinov2_vits14+cellpose4
 ```
 
 For Netron: drag `onnx_exports/<backbone>/act_inference.onnx` into
@@ -593,6 +620,7 @@ Edit in `config/config.py`:
 | `OPEN_LOOP_HORIZON` | 8 | How many actions to execute per inference at deployment. |
 | `TEMPORAL_AGG` / `TEMPORAL_AGG_K` | `True` / `0.01` | Defaults for ACT-style temporal aggregation in `rollout/main.py`. |
 | `BACKBONE` | `"resnet18"` | Defaults; override per-run with `--backbone`. |
+| `CELLPOSE4_DIAMETER` | `180.0` | CP-SAM scale setting used by the `cellpose4` backbone. |
 
 ### 10.3 Adding new control modalities
 
@@ -653,7 +681,7 @@ fixed dual-Sensapex 8-D policy. The VLA path adds:
 
 | File | Purpose |
 |---|---|
-| `config/vla_config.py` | Shared VLA dimensions, default DINOv2+Cellpose backbone, text model, paths, and rollout defaults. |
+| `config/vla_config.py` | Shared VLA dimensions, default DINOv2+Cellpose 4 backbone, text model, paths, and rollout defaults. |
 | `data/vla_dataset.py` | Metadata-driven heterogeneous episode loader with padded state/action tensors and masks. |
 | `model/language_encoder.py` | Frozen Hugging Face text encoder by default, plus a simple offline smoke-test encoder. |
 | `model/embodiment.py` | Learned robot/lab/embodiment/action/task metadata tokens. |
@@ -686,7 +714,7 @@ See `dataset_vla/README.md` for a minimal metadata example.
 
 ```bash
 python train_vla.py \
-  --backbone dinov2_vits14+cellpose \
+  --backbone dinov2_vits14+cellpose4 \
   --language-backend hf \
   --text-model distilbert-base-uncased
 ```

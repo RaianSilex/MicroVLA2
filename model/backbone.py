@@ -12,13 +12,17 @@ argument (or the `BACKBONE` config constant):
 Plus a **dual encoder** mode for hybrid generalist + domain-specialist
 features:
 
+  - `"cellpose4"`              — Cellpose 4 / Cellpose-SAM transformer
+                                  features, using the CP-SAM neck plus
+                                  averaged flow/cellprob readout channels.
   - `"dinov2_vits14+cellpose"` — DINOv2 ViT-S as the primary encoder
                                   for general scene understanding +
                                   Cellpose 3 cyto3 U-Net encoder as a
                                   cell-aware specialist. Both frozen.
-                                  Tokens from each are concatenated and
-                                  tagged with a learned type embedding.
-  - `"resnet18+cellpose"`     — same idea with ResNet18 as primary.
+  - `"dinov2_vits14+cellpose4"` — same dual idea with Cellpose 4 / CP-SAM
+                                  as the specialist stream.
+  - `"resnet18+cellpose"`      — same idea with ResNet18 as primary.
+  - `"resnet18+cellpose4"`     — ResNet18 primary + Cellpose 4 specialist.
 
 Single-encoder paths return spatial features `(B, num_channels, Hp, Wp)`,
 which the `Backbone` wrapper projects to `hidden_dim`, position-embeds,
@@ -27,9 +31,9 @@ and flattens to a token sequence.
 Dual-encoder paths run both encoders independently, project each to
 `hidden_dim`, add a per-encoder type embedding, position-embed each in
 its own normalized coordinate frame, then concatenate along the token
-sequence. Cellpose features are 2x2-avg-pooled before flattening to
-keep the token budget reasonable (240x320 -> 30x40 -> 15x20 = 300
-Cellpose tokens, vs 238x308 -> 17x22 = 374 DINOv2 tokens).
+sequence. High-resolution auxiliary features are 2x2-avg-pooled before
+flattening to keep the token budget reasonable (240x320 -> 30x40 ->
+15x20 = 300 Cellpose tokens, vs 238x308 -> 17x22 = 374 DINOv2 tokens).
 
 Multi-camera handling (concatenation along spatial dim, per-camera pos
 offsets, etc.) lives in the CVAE module, not here.
@@ -37,7 +41,10 @@ offsets, etc.) lives in the CVAE module, not here.
 
 from __future__ import annotations
 
+from importlib import metadata as importlib_metadata
 import math
+import os
+from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -55,6 +62,10 @@ _DINOV2_EMBED_DIMS = {
     "dinov2_vitg14": 1536,
 }
 _DINOV2_PATCH_SIZE = 14
+_CELLPOSE4_NAMES = {"cellpose4", "cpsam"}
+_CELLPOSE4_WEIGHTS_URL = "https://huggingface.co/mouseland/cellpose-sam/resolve/main/cpsam"
+_IMAGENET_MEAN = (0.485, 0.456, 0.406)
+_IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +259,191 @@ class CellposeBackbone(nn.Module):
 
 
 # ---------------------------------------------------------------------------
+# Cellpose 4 / Cellpose-SAM transformer feature extractor
+# ---------------------------------------------------------------------------
+
+class Cellpose4Backbone(nn.Module):
+    """Cellpose 4 / Cellpose-SAM as a frozen feature extractor.
+
+    Cellpose 4's public API is segmentation-oriented (`CellposeModel.eval`),
+    but the underlying `vit_sam.Transformer` exposes a SAM image encoder neck
+    with 256 spatial channels. This backbone uses that neck feature map and,
+    by default, concatenates three patch-level readout channels averaged from
+    the CP-SAM flow/cellprob head. The result is a compact cell-aware feature
+    grid rather than full mask post-processing inside the training loop.
+
+    The default diameter follows the raw-image Cellpose 4 setting that worked
+    well for this rig. It rescales the image the same way Cellpose eval does:
+    objects of `diameter` pixels are presented to CP-SAM at the canonical
+    30-pixel scale. `cellprob_threshold` and `flow_threshold` are kept as
+    metadata for parity with the tested segmentation recipe; they only affect
+    mask post-processing, which this feature extractor intentionally skips.
+    """
+
+    def __init__(
+        self,
+        freeze: bool = True,
+        pretrained: bool = True,
+        diameter: float = None,
+        include_readout: bool = None,
+        use_bfloat16: bool = False,
+    ):
+        super().__init__()
+        self.diameter = float(
+            getattr(C, "CELLPOSE4_DIAMETER", 180.0) if diameter is None else diameter
+        )
+        self.cellprob_threshold = float(getattr(C, "CELLPOSE4_CELLPROB_THRESHOLD", -2.0))
+        self.flow_threshold = float(getattr(C, "CELLPOSE4_FLOW_THRESHOLD", 1.5))
+        self.include_readout = bool(
+            getattr(C, "CELLPOSE4_INCLUDE_READOUT", True)
+            if include_readout is None
+            else include_readout
+        )
+
+        self.net = self._build_net(pretrained=pretrained, use_bfloat16=use_bfloat16)
+        self.num_channels = 256 + (int(getattr(self.net, "nout", 3)) if self.include_readout else 0)
+
+        self.frozen = freeze
+        if freeze:
+            for p in self.net.parameters():
+                p.requires_grad = False
+
+        self.register_buffer(
+            "_image_mean",
+            torch.tensor(_IMAGENET_MEAN, dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_image_std",
+            torch.tensor(_IMAGENET_STD, dtype=torch.float32).view(1, 3, 1, 1),
+            persistent=False,
+        )
+
+    def _build_net(self, pretrained: bool, use_bfloat16: bool):
+        try:
+            from cellpose.vit_sam import Transformer
+        except ImportError as exc:
+            try:
+                version = importlib_metadata.version("cellpose")
+            except importlib_metadata.PackageNotFoundError:
+                version = "not installed"
+            raise ImportError(
+                "The 'cellpose4' backbone requires Cellpose >= 4.0 with "
+                "Cellpose-SAM support. Install/upgrade with "
+                "`python3 -m pip install 'cellpose>=4.0'`. "
+                f"Current cellpose version: {version}."
+            ) from exc
+
+        dtype = torch.bfloat16 if use_bfloat16 else torch.float32
+        net = Transformer(dtype=dtype)
+        if pretrained:
+            weights = self._cache_pretrained()
+            net.load_model(str(weights), device=torch.device("cpu"))
+        return net
+
+    @staticmethod
+    def _cache_pretrained() -> Path:
+        model_dir_env = os.environ.get("CELLPOSE_LOCAL_MODELS_PATH")
+        model_dir = Path(model_dir_env) if model_dir_env else Path.home() / ".cellpose" / "models"
+        model_dir.mkdir(parents=True, exist_ok=True)
+        path = model_dir / "cpsam"
+        if not path.exists():
+            torch.hub.download_url_to_file(_CELLPOSE4_WEIGHTS_URL, str(path), progress=False)
+        return path
+
+    def train(self, mode: bool = True):
+        # Frozen Cellpose-SAM stays in eval mode (no random layer dropping).
+        super().train(mode)
+        if self.frozen:
+            self.net.eval()
+        return self
+
+    def _to_cellpose_rgb(self, x: torch.Tensor) -> torch.Tensor:
+        """ImageNet-normalized RGB -> Cellpose-style per-image normalized RGB."""
+        x = (x * self._image_std.to(x.dtype) + self._image_mean.to(x.dtype)).clamp(0.0, 1.0)
+        return self._percentile_normalize(x)
+
+    @staticmethod
+    def _percentile_normalize(x: torch.Tensor) -> torch.Tensor:
+        # Cellpose eval normalizes channels by low/high image percentiles. A
+        # torch implementation keeps this backbone batched and device-local.
+        orig_dtype = x.dtype
+        b, c, h, w = x.shape
+        flat = x.float().flatten(2)
+        lo = torch.quantile(flat, 0.01, dim=-1, keepdim=True)
+        hi = torch.quantile(flat, 0.99, dim=-1, keepdim=True)
+        flat = (flat - lo) / (hi - lo).clamp_min(1e-6)
+        return flat.clamp(0.0, 1.0).view(b, c, h, w).to(orig_dtype)
+
+    def _scale_for_diameter(self, x: torch.Tensor) -> torch.Tensor:
+        if self.diameter <= 0:
+            return x
+        scale = 30.0 / self.diameter
+        if abs(scale - 1.0) < 1e-6:
+            return x
+
+        _, _, h, w = x.shape
+        ps = int(getattr(self.net, "ps", 8))
+        h2 = max(ps, int(math.ceil((h * scale) / ps) * ps))
+        w2 = max(ps, int(math.ceil((w * scale) / ps) * ps))
+        if (h2, w2) == (h, w):
+            return x
+        return F.interpolate(x, size=(h2, w2), mode="bilinear", align_corners=False)
+
+    @staticmethod
+    def _resize_pos_embed(pos: torch.Tensor, h: int, w: int, dtype: torch.dtype) -> torch.Tensor:
+        if tuple(pos.shape[1:3]) == (h, w):
+            return pos.to(dtype=dtype)
+        pos_nchw = pos.permute(0, 3, 1, 2).float()
+        pos_nchw = F.interpolate(pos_nchw, size=(h, w), mode="bicubic", align_corners=False)
+        return pos_nchw.permute(0, 2, 3, 1).to(dtype=dtype)
+
+    def _forward_neck(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        net_dtype = next(self.net.parameters()).dtype
+        x = x.to(dtype=net_dtype)
+
+        tokens = self.net.encoder.patch_embed(x)                 # (B, Hp, Wp, D)
+        if self.net.encoder.pos_embed is not None:
+            pos = self._resize_pos_embed(
+                self.net.encoder.pos_embed,
+                tokens.shape[1],
+                tokens.shape[2],
+                tokens.dtype,
+            )
+            tokens = tokens + pos
+
+        if self.net.training and getattr(self.net, "rdrop", 0.0) > 0:
+            nlay = len(self.net.encoder.blocks)
+            probs = torch.linspace(0, self.net.rdrop, nlay, device=tokens.device)
+            drop = (torch.rand((tokens.shape[0], nlay), device=tokens.device) < probs).to(tokens.dtype)
+            for i, block in enumerate(self.net.encoder.blocks):
+                mask = drop[:, i].view(-1, 1, 1, 1)
+                tokens = tokens * mask + block(tokens) * (1 - mask)
+        else:
+            for block in self.net.encoder.blocks:
+                tokens = block(tokens)
+
+        feat = self.net.encoder.neck(tokens.permute(0, 3, 1, 2))  # (B, 256, Hp, Wp)
+        if self.include_readout:
+            readout = self.net.out(feat)                          # (B, nout*ps^2, Hp, Wp)
+            b, _, hp, wp = readout.shape
+            nout = int(getattr(self.net, "nout", 3))
+            ps = int(getattr(self.net, "ps", 8))
+            readout = readout.view(b, nout, ps * ps, hp, wp).mean(dim=2)
+            feat = torch.cat([feat, readout.to(dtype=feat.dtype)], dim=1)
+        return feat.to(dtype=orig_dtype)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 3, H, W) ImageNet-normalized RGB.
+        x = self._to_cellpose_rgb(x)
+        x = self._scale_for_diameter(x)
+        ctx = torch.no_grad() if self.frozen else torch.enable_grad()
+        with ctx:
+            return self._forward_neck(x)
+
+
+# ---------------------------------------------------------------------------
 # 2D sinusoidal position embedding (DETR-style)
 # ---------------------------------------------------------------------------
 
@@ -298,9 +494,12 @@ def _build_single_encoder(name: str, pretrained: bool, freeze: bool):
     if name == "cellpose":
         m = CellposeBackbone(freeze=freeze)
         return m, m.num_channels
+    if name in _CELLPOSE4_NAMES:
+        m = Cellpose4Backbone(freeze=freeze, pretrained=pretrained)
+        return m, m.num_channels
     raise ValueError(
         f"Unknown backbone {name!r}. Supported: 'resnet18', "
-        f"{list(_DINOV2_EMBED_DIMS)}, 'cellpose'."
+        f"{list(_DINOV2_EMBED_DIMS)}, 'cellpose', 'cellpose4'."
     )
 
 
@@ -312,11 +511,12 @@ class Backbone(nn.Module):
         forward(x) returns (feat, pos) — both shape (B, hidden_dim, Hp, Wp).
         Backward-compatible with previous Backbone.
 
-    Dual-encoder mode (e.g. `backbone_name='dinov2_vits14+cellpose'`):
+    Dual-encoder mode (e.g. `backbone_name='dinov2_vits14+cellpose4'`):
         forward(x) returns (tokens, pos_tokens) — both shape (S, B, hidden_dim).
         Tokens from the two encoders are concatenated along the sequence
-        dim, each tagged with a learned type embedding. Cellpose features
-        are 2x2-avg-pooled before flattening to keep the token budget down.
+        dim, each tagged with a learned type embedding. Large auxiliary
+        feature grids are 2x2-avg-pooled before flattening to keep the token
+        budget down.
     """
 
     def __init__(
@@ -349,9 +549,9 @@ class Backbone(nn.Module):
             aux, aux_chan = _build_single_encoder(aux_name, pretrained, freeze)
             self._set_encoder(aux_name, aux)
             self.input_proj_aux = nn.Conv2d(aux_chan, hidden_dim, kernel_size=1)
-            # 2x2 average pool to halve aux spatial extent (Cellpose is at
-            # 1/8 native resolution; this brings it to 1/16, similar to
-            # DINOv2's 1/14 patch grid).
+            # 2x2 average pool to halve large aux spatial extents (Cellpose 3
+            # is at 1/8 native resolution; this brings it near DINOv2's 1/14
+            # patch grid). Very small Cellpose 4 grids skip this in forward().
             self.aux_pool = nn.AvgPool2d(kernel_size=2, stride=2)
             # Token-type embeddings: 0 = primary, 1 = auxiliary.
             self.type_embed = nn.Embedding(2, hidden_dim)
@@ -370,18 +570,25 @@ class Backbone(nn.Module):
             self.dinov2 = module
         elif name == "cellpose":
             self.cellpose = module
+        elif name in _CELLPOSE4_NAMES:
+            self.cellpose4 = module
         else:
             raise ValueError(f"unreachable: {name!r}")
 
+    def _encoder_feat(self, name: str, x: torch.Tensor) -> torch.Tensor:
+        if name == "resnet18":
+            return self.resnet(x)
+        if name in _DINOV2_EMBED_DIMS:
+            return self.dinov2(x)
+        if name == "cellpose":
+            return self.cellpose(x)
+        if name in _CELLPOSE4_NAMES:
+            return self.cellpose4(x)
+        raise ValueError(f"unreachable: {name!r}")
+
     def _primary_feat(self, x: torch.Tensor) -> torch.Tensor:
         primary_name = self.primary_name if self.is_dual else self.backbone_name
-        if primary_name == "resnet18":
-            return self.resnet(x)
-        if primary_name in _DINOV2_EMBED_DIMS:
-            return self.dinov2(x)
-        if primary_name == "cellpose":
-            return self.cellpose(x)
-        raise ValueError(f"unreachable: {primary_name!r}")
+        return self._encoder_feat(primary_name, x)
 
     def forward(self, x: torch.Tensor):
         """
@@ -396,9 +603,11 @@ class Backbone(nn.Module):
         if not self.is_dual:
             return feat_p, pos_p
 
-        # Auxiliary encoder (currently always Cellpose)
-        feat_a = self.cellpose(x)                            # (B, 256, H/8, W/8)
-        feat_a = self.aux_pool(feat_a)                        # (B, 256, H/16, W/16)
+        # Auxiliary encoder. Pool only if the feature grid is large enough;
+        # Cellpose 4 with diameter scaling can already be very compact.
+        feat_a = self._encoder_feat(self.aux_name, x)
+        if min(feat_a.shape[-2:]) >= 16:
+            feat_a = self.aux_pool(feat_a)
         feat_a = self.input_proj_aux(feat_a)                  # (B, D, h, w)
         pos_a = self.pos_embed(feat_a)
 
