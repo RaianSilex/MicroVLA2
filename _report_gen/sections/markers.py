@@ -25,9 +25,40 @@ def add(story):
         "external tool to recognize the directory; not part of MicroACT itself.",
     ])
 
+    h1(story, "README.md (pipeline reference)")
+    body(story, "The top-level README is not executable, but it is the repo's "
+                "operator-facing contract. It confirms the intended Cellpose4 "
+                "usage, the supported backbones, the training/rollout commands, "
+                "and the MicroVLA extension points that the code sections above "
+                "implement.")
+    h2(story, "Cellpose4-facing commands and defaults")
+    code_block(story, "README.md - Cellpose4 examples", """\
+python train.py --backbone dinov2_vits14+cellpose4
+python train_vla.py --backbone dinov2_vits14+cellpose4
+python viz_summary.py --backbone dinov2_vits14+cellpose4 > arch_dual.txt
+python export_onnx.py --backbone dinov2_vits14+cellpose4
+
+CELLPOSE4_DIAMETER = 180.0
+CELLPOSE4_CELLPROB_THRESHOLD = -2.0
+CELLPOSE4_FLOW_THRESHOLD = 1.5""")
+    bullets(story, [
+        "<b>Default VLA backbone</b> is documented as "
+        "<code>dinov2_vits14+cellpose4</code>: DINOv2 supplies general visual tokens, "
+        "while Cellpose-SAM supplies compact cell-aware tokens.",
+        "<b>Token budget</b> matches the code: DINOv2 ViT-S gives about "
+        "<code>17x22 = 374</code> image tokens at the default resolution, and "
+        "Cellpose4 diameter scaling gives about <code>5x7 = 35</code> aux tokens, "
+        "for roughly <code>409</code> total visual tokens.",
+        "<b>Install note</b>: <code>cellpose&gt;=4.0</code> is required only when "
+        "using <code>cellpose</code> or <code>cellpose4</code> backbones; the ResNet "
+        "baseline can train without it.",
+        "<b>README/code alignment</b>: the README says the training path uses CP-SAM "
+        "features/readout tensors directly rather than generating masks per batch; "
+        "that is exactly what <code>Cellpose4Backbone._forward_neck</code> does.",
+    ])
+
     h1(story, "dataset_vla/README.md (data layout reference)")
-    body(story, "The user requested README files be skipped. This one is included "
-                "because it documents the on-disk schema that "
+    body(story, "This README documents the on-disk schema that "
                 "<code>data/vla_dataset.py</code> consumes; without seeing the schema "
                 "the dataset code is not fully grounded.")
     h2(story, "On-disk layout")
@@ -80,4 +111,68 @@ dataset_vla/
         "If the CSV's <code>image_path</code> column is empty for a row, "
         "<code>_resolve_image_path</code> tries this conventional path before "
         "giving up to a black frame.",
+    ])
+
+    h1(story, "_report_gen/ (PDF generator source)")
+    body(story, "These files generate this PDF. They are not part of the training or "
+                "rollout runtime, but they are included here for repo completeness. "
+                "The design is deliberately simple: <code>build_report.py</code> owns "
+                "ReportLab styles, page footer, helper functions, and section ordering; "
+                "each file under <code>_report_gen/sections/</code> appends one topic "
+                "to the shared story list.")
+    h2(story, "build_report.py")
+    code_block(story, "_report_gen/build_report.py - assembly pattern", """\
+from sections import preamble, top_level, config_files, data_files
+from sections import model_act, model_vla, finetune, rollout_files, viz_files, markers
+
+def main():
+    story = []
+    title_block(story, "MicroACT + MicroVLA Full Code Explanation Report", subtitle)
+    preamble.add(story)
+    top_level.add(story)
+    config_files.add(story)
+    data_files.add(story)
+    model_act.add(story)
+    model_vla.add(story)
+    finetune.add(story)
+    rollout_files.add(story)
+    viz_files.add(story)
+    markers.add(story)
+    out = Path(__file__).resolve().parents[1] / "microact_full_code_report_cellpose4.pdf"
+    build(out, story)""")
+    bullets(story, [
+        "<b>Styles</b>: title, subtitle, heading, body, bullet, code-label, and code "
+        "paragraph styles are defined once in <code>build_report.py</code>. Section "
+        "files call helper functions (<code>h1</code>, <code>body</code>, "
+        "<code>bullets</code>, <code>code_block</code>) instead of touching ReportLab "
+        "directly.",
+        "<b>Output path</b>: the regenerated Cellpose4 report is written into the "
+        "current repo root as <code>microact_full_code_report_cellpose4.pdf</code>, "
+        "avoiding the old hard-coded <code>/home/raianlaptop/MicroACT</code> path.",
+        "<b>Footer</b>: every page gets the same report title and page number through "
+        "a ReportLab <code>PageTemplate</code> callback.",
+    ])
+    h2(story, "Section modules")
+    bullets(story, [
+        "<code>_report_gen/sections/preamble.py</code> — shared shape legend, "
+        "Cellpose4 update coverage, and end-to-end ACT/VLA tensor flow.",
+        "<code>_report_gen/sections/top_level.py</code> — requirements, .gitignore, "
+        "utils, train.py, train_vla.py, export_onnx.py, and evaluate.py.",
+        "<code>_report_gen/sections/config_files.py</code> — ACT config plus VLA config.",
+        "<code>_report_gen/sections/data_files.py</code> — homogeneous ACT dataset and "
+        "heterogeneous VLA dataset.",
+        "<code>_report_gen/sections/model_act.py</code> — transformer primitives, "
+        "all image backbones including Cellpose4, ACTCVAE, and ACTPolicy.",
+        "<code>_report_gen/sections/model_vla.py</code> — language encoder, embodiment "
+        "tokens, VLACVAE, and VLAPolicy.",
+        "<code>_report_gen/sections/finetune.py</code> — VLA finetune helpers, freeze "
+        "modes, partial state-dict loading, and LoRA.",
+        "<code>_report_gen/sections/rollout_files.py</code> — shared rollout helpers, "
+        "MicroACT rollout, MicroVLA rollout, ROS/Sensapex client, and adapter.",
+        "<code>_report_gen/sections/viz_files.py</code> — torchinfo and torchviz "
+        "visualization helpers.",
+        "<code>_report_gen/sections/markers.py</code> — marker files, READMEs, and "
+        "this generator-source inventory.",
+        "<code>_report_gen/sections/__init__.py</code> — empty package marker so "
+        "section modules import cleanly.",
     ])

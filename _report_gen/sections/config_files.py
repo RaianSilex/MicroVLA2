@@ -61,7 +61,7 @@ CSV_TIMESTEP_COL = "timestep\"""")
         "The CSV column tuples define the <i>order</i> in which dataframes are sliced "
         "into the qpos and action arrays — change the tuple to change the column order.",
     ])
-    code_block(story, "config/config.py:42-69 - hyperparameters and rollout", """\
+    code_block(story, "config/config.py:42-74 - hyperparameters, Cellpose4, rollout", """\
 # ---------- ACT model hyperparameters ----------
 CHUNK_SIZE = 100          # k: number of future actions predicted per inference
 HIDDEN_DIM = 512
@@ -75,6 +75,12 @@ KL_WEIGHT = 10.0          # beta on the KL term (ACT paper default)
 
 BACKBONE = "resnet18"
 BACKBONE_PRETRAINED = True
+
+# Cellpose 4 / Cellpose-SAM defaults.
+CELLPOSE4_DIAMETER = 180.0
+CELLPOSE4_CELLPROB_THRESHOLD = -2.0
+CELLPOSE4_FLOW_THRESHOLD = 1.5
+CELLPOSE4_INCLUDE_READOUT = True
 
 # ---------- Training ----------
 BATCH_SIZE = 8
@@ -100,6 +106,15 @@ TEMPORAL_AGG_K = 0.01""")
         "and <code>logvar (B,32)</code>.",
         "<b>KL_WEIGHT = 10.0</b> is the &beta; multiplier on the KL term in "
         "ACTPolicy._compute_loss.",
+        "<b>CELLPOSE4_DIAMETER = 180.0</b> controls the CP-SAM scale conversion: "
+        "raw frames are resized so 180-pixel cells are presented at Cellpose's "
+        "canonical 30-pixel object diameter before feature extraction.",
+        "<b>CELLPOSE4_INCLUDE_READOUT = True</b> concatenates three averaged "
+        "flow/cellprob readout channels onto the 256-channel CP-SAM neck, so the "
+        "Cellpose4 backbone exposes <code>259</code> channels before the 1x1 projection.",
+        "<b>CELLPOSE4_CELLPROB_THRESHOLD</b> and <b>CELLPOSE4_FLOW_THRESHOLD</b> are "
+        "kept beside the backbone settings for parity with the tested mask recipe, "
+        "even though training uses CP-SAM features directly rather than postprocessed masks.",
         "<b>OPEN_LOOP_HORIZON = 8</b> is how many of the 100 predicted actions to actually "
         "execute before re-running inference (when temporal aggregation is OFF).",
         "<b>TEMPORAL_AGG_K = 0.01</b> is the decay rate in <code>exp(-k * age)</code> "

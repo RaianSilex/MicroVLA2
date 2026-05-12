@@ -424,7 +424,7 @@ def forward(self, image, qpos, instructions,
     return a_hat, (mu, logvar)""")
     bullets(story, [
         "<b>Token concatenation order in the source</b>: latent (1) + qpos (1) + "
-        "5 metadata + 32 language + S_img image. For the default DINOv2+Cellpose at "
+        "5 metadata + 32 language + S_img image. For the default DINOv2+Cellpose4 at "
         "240x320 with 1 camera and the default Cellpose 4 diameter scaling: "
         "<code>2 + 5 + 32 + ~409 = ~448</code> source tokens.",
         "<b>extra_src_pos.weight[: non_image.size(0)]</b> uses Python slicing on the "

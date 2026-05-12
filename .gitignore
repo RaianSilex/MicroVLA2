@@ -26,6 +26,7 @@ dist/
 .ruff_cache/
 .coverage
 htmlcov/
+_report_gen/
 
 # ML artifacts (too large for git; rebuild from requirements + dataset)
 checkpoints/

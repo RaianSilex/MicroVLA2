@@ -20,6 +20,28 @@ def add(story):
         "Image batches are <b>(B, N, 3, H, W)</b>. Action chunks are <b>(B, k, action_dim)</b>.",
     ])
 
+    h1(story, "Cellpose4 Update Coverage")
+    body(story, "The prior PDF was generated before the May 6, 2026 Cellpose4 commit. "
+                "This regenerated report uses the current repo as source of truth and "
+                "adds the missing Cellpose-SAM details wherever they affect runtime "
+                "behavior, tensor shapes, checkpoint metadata, exports, and README-level "
+                "usage.")
+    bullets(story, [
+        "<b>model/backbone.py</b>: new <code>Cellpose4Backbone</code> path, "
+        "<code>cellpose4</code>/<code>cpsam</code> aliases, CP-SAM weight cache, "
+        "percentile normalization, diameter scaling, CP-SAM neck/readout extraction, "
+        "and dual-encoder fusion with DINOv2 or ResNet.",
+        "<b>config/config.py</b> and <b>config/vla_config.py</b>: Cellpose4 scale/readout "
+        "defaults and VLA's default <code>dinov2_vits14+cellpose4</code> backbone.",
+        "<b>requirements.txt</b>, <b>train.py</b>, <b>train_vla.py</b>, "
+        "<b>export_onnx.py</b>, <b>viz_summary.py</b>, <b>viz_torchviz.py</b>, and "
+        "<b>rollout/</b>: CLI/help/checkpoint paths now accept Cellpose4-capable "
+        "backbone names and preserve the frozen-backbone behavior.",
+        "<b>README.md</b>: the operator-facing commands, token-count estimates, "
+        "recommended backbones, and CP-SAM settings are folded into this report as "
+        "context for the source walkthrough.",
+    ])
+
     h1(story, "End-to-End Tensor Flow — MicroACT (single robot)")
     bullets(story, [
         "Dataset sample: <b>image (1,3,240,320)</b>, <b>qpos (8,)</b>, "

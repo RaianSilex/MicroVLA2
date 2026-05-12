@@ -433,7 +433,161 @@ class CellposeBackbone(nn.Module):
         "<code>cellpose.models</code> API is never touched.",
     ])
 
-    code_block(story, "model/backbone.py:254-283 - PositionEmbeddingSine2D", """\
+    h3(story, "Cellpose4Backbone / CP-SAM feature extractor")
+    body(story, "This is the Cellpose4 integration added after the original PDF. "
+                "It uses Cellpose-SAM as a frozen feature extractor, not as a mask "
+                "generator during training. The transformer neck and optional "
+                "flow/cellprob readout become another spatial feature map that the "
+                "standard 1x1 projection turns into <code>D=512</code> tokens.")
+    code_block(story, "model/backbone.py:265-342 - Cellpose4Backbone init + weight loading", """\
+class Cellpose4Backbone(nn.Module):
+    def __init__(self, freeze=True, pretrained=True,
+                 diameter=None, include_readout=None, use_bfloat16=False):
+        super().__init__()
+        self.diameter = float(
+            getattr(C, "CELLPOSE4_DIAMETER", 180.0) if diameter is None else diameter)
+        self.cellprob_threshold = float(getattr(C, "CELLPOSE4_CELLPROB_THRESHOLD", -2.0))
+        self.flow_threshold = float(getattr(C, "CELLPOSE4_FLOW_THRESHOLD", 1.5))
+        self.include_readout = bool(
+            getattr(C, "CELLPOSE4_INCLUDE_READOUT", True)
+            if include_readout is None else include_readout)
+
+        self.net = self._build_net(pretrained=pretrained, use_bfloat16=use_bfloat16)
+        self.num_channels = 256 + (
+            int(getattr(self.net, "nout", 3)) if self.include_readout else 0)
+
+        self.frozen = freeze
+        if freeze:
+            for p in self.net.parameters():
+                p.requires_grad = False
+
+    def _build_net(self, pretrained: bool, use_bfloat16: bool):
+        from cellpose.vit_sam import Transformer
+        dtype = torch.bfloat16 if use_bfloat16 else torch.float32
+        net = Transformer(dtype=dtype)
+        if pretrained:
+            weights = self._cache_pretrained()
+            net.load_model(str(weights), device=torch.device("cpu"))
+        return net""")
+    bullets(story, [
+        "<b>Import target</b>: <code>cellpose.vit_sam.Transformer</code> is the "
+        "Cellpose-SAM model used by Cellpose 4. If that import fails, the code raises "
+        "an explicit <code>Cellpose &gt;= 4.0</code> installation error and reports the "
+        "installed version.",
+        "<b>num_channels</b>: CP-SAM neck emits <code>256</code> channels. With "
+        "<code>CELLPOSE4_INCLUDE_READOUT=True</code>, the readout head contributes "
+        "<code>nout=3</code> averaged channels, so native output is "
+        "<code>(B,259,Hp,Wp)</code> before the backbone wrapper projects it to "
+        "<code>(B,512,Hp,Wp)</code>.",
+        "<b>pretrained=True</b> downloads/loads the Hugging Face <code>cpsam</code> "
+        "weights. Passing <code>--no-pretrained</code> builds the architecture without "
+        "that large CP-SAM weight download.",
+        "<b>freeze=True</b> marks CP-SAM parameters non-trainable. The later "
+        "<code>train()</code> override keeps the module in eval mode so random layer "
+        "dropping cannot turn on accidentally.",
+    ])
+
+    code_block(story, "model/backbone.py:344-391 - cache, normalize, diameter scale", """\
+@staticmethod
+def _cache_pretrained() -> Path:
+    model_dir_env = os.environ.get("CELLPOSE_LOCAL_MODELS_PATH")
+    model_dir = Path(model_dir_env) if model_dir_env else Path.home() / ".cellpose" / "models"
+    model_dir.mkdir(parents=True, exist_ok=True)
+    path = model_dir / "cpsam"
+    if not path.exists():
+        torch.hub.download_url_to_file(_CELLPOSE4_WEIGHTS_URL, str(path), progress=False)
+    return path
+
+def _to_cellpose_rgb(self, x):
+    # ImageNet-normalized RGB -> real RGB [0,1] -> percentile-normalized RGB.
+    x = (x * self._image_std.to(x.dtype) + self._image_mean.to(x.dtype)).clamp(0.0, 1.0)
+    return self._percentile_normalize(x)
+
+@staticmethod
+def _percentile_normalize(x):
+    b, c, h, w = x.shape
+    flat = x.float().flatten(2)                         # (B,3,H*W)
+    lo = torch.quantile(flat, 0.01, dim=-1, keepdim=True)
+    hi = torch.quantile(flat, 0.99, dim=-1, keepdim=True)
+    flat = (flat - lo) / (hi - lo).clamp_min(1e-6)
+    return flat.clamp(0.0, 1.0).view(b, c, h, w).to(x.dtype)
+
+def _scale_for_diameter(self, x):
+    scale = 30.0 / self.diameter                         # 180 px -> 1/6 size
+    _, _, h, w = x.shape
+    ps = int(getattr(self.net, "ps", 8))
+    h2 = max(ps, int(math.ceil((h * scale) / ps) * ps))
+    w2 = max(ps, int(math.ceil((w * scale) / ps) * ps))
+    return F.interpolate(x, size=(h2, w2), mode="bilinear", align_corners=False)""")
+    bullets(story, [
+        "<b>Cache path</b>: default is <code>~/.cellpose/models/cpsam</code>, unless "
+        "<code>CELLPOSE_LOCAL_MODELS_PATH</code> points elsewhere. That keeps the "
+        "weight file compatible with normal Cellpose tooling.",
+        "<b>Input convention conversion</b>: upstream ACT code feeds ImageNet-normalized "
+        "RGB. CP-SAM expects Cellpose-style RGB, so this code unnormalizes to "
+        "<code>[0,1]</code>, then performs per-image 1st/99th percentile scaling.",
+        "<b>Percentile shapes</b>: <code>flat</code> is <code>(B,3,H*W)</code>; "
+        "<code>lo</code> and <code>hi</code> are <code>(B,3,1)</code>, broadcasting "
+        "back over every pixel in each channel.",
+        "<b>Diameter scaling</b>: the default <code>180</code> pixel object diameter "
+        "maps to Cellpose's canonical <code>30</code> pixels, so a "
+        "<code>240x320</code> image becomes about <code>40x56</code>, rounded up to "
+        "multiples of CP-SAM patch size <code>ps=8</code>. The patch grid is then "
+        "about <code>5x7</code> = <code>35</code> tokens.",
+    ])
+
+    code_block(story, "model/backbone.py:393-443 - CP-SAM neck/readout forward", """\
+def _resize_pos_embed(pos, h, w, dtype):
+    if tuple(pos.shape[1:3]) == (h, w):
+        return pos.to(dtype=dtype)
+    pos_nchw = pos.permute(0, 3, 1, 2).float()
+    pos_nchw = F.interpolate(pos_nchw, size=(h, w), mode="bicubic", align_corners=False)
+    return pos_nchw.permute(0, 2, 3, 1).to(dtype=dtype)
+
+def _forward_neck(self, x):
+    tokens = self.net.encoder.patch_embed(x)              # (B, Hp, Wp, D_sam)
+    if self.net.encoder.pos_embed is not None:
+        pos = self._resize_pos_embed(self.net.encoder.pos_embed,
+                                     tokens.shape[1], tokens.shape[2], tokens.dtype)
+        tokens = tokens + pos
+
+    for block in self.net.encoder.blocks:
+        tokens = block(tokens)
+
+    feat = self.net.encoder.neck(tokens.permute(0, 3, 1, 2))  # (B,256,Hp,Wp)
+    if self.include_readout:
+        readout = self.net.out(feat)                          # (B,nout*ps^2,Hp,Wp)
+        b, _, hp, wp = readout.shape
+        nout = int(getattr(self.net, "nout", 3))
+        ps = int(getattr(self.net, "ps", 8))
+        readout = readout.view(b, nout, ps * ps, hp, wp).mean(dim=2)
+        feat = torch.cat([feat, readout.to(dtype=feat.dtype)], dim=1)
+    return feat                                               # (B,259,Hp,Wp)
+
+def forward(self, x):
+    x = self._to_cellpose_rgb(x)
+    x = self._scale_for_diameter(x)
+    ctx = torch.no_grad() if self.frozen else torch.enable_grad()
+    with ctx:
+        return self._forward_neck(x)""")
+    bullets(story, [
+        "<b>Patch embed output</b> is channel-last <code>(B,Hp,Wp,D_sam)</code>, matching "
+        "the internal Cellpose-SAM transformer blocks. Before the neck it is permuted "
+        "to <code>(B,D_sam,Hp,Wp)</code>.",
+        "<b>Position embedding resize</b> is necessary because diameter scaling can "
+        "produce a patch grid different from the CP-SAM pretraining grid. Bicubic "
+        "interpolation preserves a smooth 2D positional field.",
+        "<b>Readout averaging</b>: <code>self.net.out(feat)</code> emits "
+        "<code>nout * ps^2</code> channels. Reshaping to "
+        "<code>(B,nout,ps*ps,Hp,Wp)</code> and averaging over <code>ps*ps</code> "
+        "collapses patch-internal flow/cellprob predictions into 3 extra channels.",
+        "<b>No masks in the training loop</b>: this stops before Cellpose's flow "
+        "integration / mask post-processing. The policy learns from CP-SAM feature "
+        "tokens, keeping batches differentiable and avoiding expensive per-frame "
+        "segmentation outputs.",
+    ])
+
+    code_block(story, "model/backbone.py:450-479 - PositionEmbeddingSine2D", """\
 class PositionEmbeddingSine2D(nn.Module):
     def __init__(self, num_pos_feats=128, temperature=10000):
         super().__init__()
@@ -474,7 +628,7 @@ class PositionEmbeddingSine2D(nn.Module):
         "<code>stack(sin(...), cos(...)).flatten</code> interleaves sin and cos.",
     ])
 
-    code_block(story, "model/backbone.py:290-304 - _build_single_encoder", """\
+    code_block(story, "model/backbone.py:486-503 - _build_single_encoder", """\
 def _build_single_encoder(name: str, pretrained: bool, freeze: bool):
     if name == "resnet18":
         m = ResNet18Backbone(pretrained=pretrained)
@@ -490,7 +644,7 @@ def _build_single_encoder(name: str, pretrained: bool, freeze: bool):
         return m, m.num_channels
     raise ValueError(...)""")
 
-    code_block(story, "model/backbone.py:307-362 - Backbone (single + dual mode)", """\
+    code_block(story, "model/backbone.py:506-585 - Backbone (single + dual mode)", """\
 class Backbone(nn.Module):
     def __init__(self, hidden_dim=C.HIDDEN_DIM, pretrained=C.BACKBONE_PRETRAINED,
                  backbone_name=None, freeze=True):
@@ -535,7 +689,7 @@ class Backbone(nn.Module):
         "15x20 — while already-small Cellpose 4 diameter-scaled grids skip pooling.",
     ])
 
-    code_block(story, "model/backbone.py:386-420 - Backbone.forward", """\
+    code_block(story, "model/backbone.py:605-636 - Backbone.forward", """\
 def forward(self, x: torch.Tensor):
     feat_p = self._primary_feat(x)                    # (B, primary_chan, Hp, Wp)
     feat_p = self.input_proj(feat_p)                  # (B, D, Hp, Wp)

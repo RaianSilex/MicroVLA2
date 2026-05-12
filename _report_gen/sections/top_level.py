@@ -57,10 +57,10 @@ dataset/saved_frames/
 dataset/saved_videos/""")
     bullets(story, [
         "<b>checkpoints/</b> and <b>*.pt / *.pth / *.ckpt</b> together exclude all "
-        "PyTorch checkpoints. The new VLA pipeline writes to <b>checkpoints_vla/</b> "
-        "which matches <code>checkpoints*</code> rules implicitly through the "
-        "<code>*.pt</code> wildcards but is not specifically listed; the .gitignore "
-        "currently relies on the file-suffix wildcards to keep VLA checkpoints out.",
+        "PyTorch checkpoints. The VLA pipeline writes to <b>checkpoints_vla/</b>; "
+        "that directory is not explicitly listed, but the <code>*.pt</code> and "
+        "<code>*.pkl</code> wildcards still exclude the policy checkpoints and stats "
+        "files written there.",
         "Saved frames and videos under <b>dataset/saved_frames/</b> and "
         "<b>dataset/saved_videos/</b> are excluded as they are binary blobs.",
     ])
@@ -220,8 +220,9 @@ def parse_args() -> argparse.Namespace:
         "<b>--val-by-trial</b> avoids leaking adjacent timesteps into val by holding "
         "out whole trials. The default (random per-timestep split) is statistically "
         "more efficient with a small trial count but does leak nearby frames.",
-        "<b>--no-pretrained</b> disables ImageNet weight downloads — needed when "
-        "running offline. <b>--unfreeze-backbone</b> turns frozen DINOv2/Cellpose "
+        "<b>--no-pretrained</b> disables ImageNet ResNet18 and Cellpose4 CP-SAM weight "
+        "downloads — useful when running offline. DINOv2 still loads through "
+        "<code>torch.hub</code>. <b>--unfreeze-backbone</b> turns frozen DINOv2/Cellpose "
         "encoders into trainable ones (use <code>--lr-backbone</code> to set their LR).",
     ])
     code_block(story, "train.py:61-84 - run_epoch", """\

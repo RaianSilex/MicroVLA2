@@ -200,8 +200,9 @@ def main():
         story,
         "MicroACT + MicroVLA Full Code Explanation Report",
         "Line-level walkthrough of every source file in the repo, with explicit "
-        "tensor shapes at every step. README.md and the existing PDFs are skipped by "
-        "request; everything else is covered.",
+        "tensor shapes at every step. Updated from the current MicroVLA repo after "
+        "the May 6, 2026 Cellpose4 / Cellpose-SAM integration; READMEs are used as "
+        "schema and pipeline references, while generated artifacts are skipped.",
     )
 
     preamble.add(story)
@@ -215,7 +216,7 @@ def main():
     viz_files.add(story)
     markers.add(story)
 
-    out = Path("/home/raianlaptop/MicroACT/microact_full_code_report.pdf")
+    out = Path(__file__).resolve().parents[1] / "microact_full_code_report_cellpose4.pdf"
     build(out, story)
     print(f"wrote {out} ({out.stat().st_size // 1024} KB)")
 
