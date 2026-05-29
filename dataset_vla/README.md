@@ -44,3 +44,25 @@ Minimal `metadata.json`:
 Single-manipulator episodes can use `state_dim: 4` and `action_dim: 4`.
 The loader pads all state/action tensors to the shared VLA maximums and masks
 invalid dimensions during loss computation.
+
+## Convert an existing MicroACT dataset
+
+If you already have the classic MicroACT layout:
+
+```text
+dataset/
+├── logs/trial_N.csv
+└── saved_frames/trial_N/frame_000000.png
+```
+
+convert it before running `train_vla.py`:
+
+```bash
+python3 dataset_vla/convert_microact_to_vla.py \
+  --replace-zero-targets-with-state
+```
+
+The converter writes `dataset_vla/episodes/trial_N/metadata.json`,
+`trajectory.csv`, and `frames/cam_main/`. By default frames are symlinked, not
+copied, so the conversion does not duplicate the image dataset. Use
+`--frame-mode copy` if you need a standalone `dataset_vla/` tree.
