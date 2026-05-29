@@ -42,6 +42,7 @@ torchviz_exports/
 # Dataset (use external storage / Git LFS, not git)
 dataset/saved_frames/
 dataset/saved_videos/
+dataset/logs/
 
 # Editor / IDE
 .vscode/
