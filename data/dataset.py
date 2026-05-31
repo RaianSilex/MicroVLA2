@@ -94,7 +94,9 @@ def _resolve_image_path(raw: str, trial_id: int, t: int) -> Optional[Path]:
 def _load_image(path: Optional[Path], h: int, w: int) -> np.ndarray:
     if path is None:
         return np.zeros((h, w, 3), dtype=np.uint8)
-    img = Image.open(path).convert("RGB").resize((w, h), Image.BILINEAR)
+    img = Image.open(path).convert("RGB")
+    if img.size != (w, h):
+        img = img.resize((w, h), Image.BILINEAR)
     return np.asarray(img, dtype=np.uint8)
 
 

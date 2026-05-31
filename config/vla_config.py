@@ -5,13 +5,19 @@ module defines the wider contract used when demonstrations come from multiple
 robots, labs, action conventions, and language-labeled tasks.
 """
 
+import os
 from pathlib import Path
 
 from config import config as ACT
 
 # ---------- Paths ----------
 REPO_ROOT = ACT.REPO_ROOT
-VLA_DATASET_ROOT = REPO_ROOT / "dataset_vla"
+_VLA_DATASET_ROOT_ENV = os.environ.get("MICROVLA_VLA_DATASET_ROOT")
+VLA_DATASET_ROOT = (
+    Path(_VLA_DATASET_ROOT_ENV).expanduser()
+    if _VLA_DATASET_ROOT_ENV
+    else REPO_ROOT / "dataset_vla"
+)
 VLA_EPISODES_DIR = VLA_DATASET_ROOT / "episodes"
 VLA_CKPT_DIR = REPO_ROOT / "checkpoints_vla"
 VLA_STATS_PATH = VLA_CKPT_DIR / "vla_stats.pkl"

@@ -265,7 +265,9 @@ def _resolve_image_path(ep: VLAEpisode, raw: str, t: int, camera_name: str) -> O
 def _load_image(path: Optional[Path], h: int, w: int) -> np.ndarray:
     if path is None:
         return np.zeros((h, w, 3), dtype=np.uint8)
-    img = Image.open(path).convert("RGB").resize((w, h), Image.BILINEAR)
+    img = Image.open(path).convert("RGB")
+    if img.size != (w, h):
+        img = img.resize((w, h), Image.BILINEAR)
     return np.asarray(img, dtype=np.uint8)
 
 

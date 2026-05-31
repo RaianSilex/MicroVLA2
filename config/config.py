@@ -5,11 +5,17 @@ no focusing motor and no pressure solenoids. To add those later, bump
 STATE_DIM / ACTION_DIM and extend CSV_STATE_COLS / CSV_ACTION_COLS.
 """
 
+import os
 from pathlib import Path
 
 # ---------- Paths ----------
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DATASET_ROOT = REPO_ROOT / "dataset"
+_DATASET_ROOT_ENV = os.environ.get("MICROVLA_DATASET_ROOT")
+DATASET_ROOT = (
+    Path(_DATASET_ROOT_ENV).expanduser()
+    if _DATASET_ROOT_ENV
+    else REPO_ROOT / "dataset"
+)
 LOGS_DIR = DATASET_ROOT / "logs"                 # trial_N.csv
 FRAMES_DIR = DATASET_ROOT / "saved_frames"       # trial_N/frame_NNNNNN.png
 CKPT_DIR = REPO_ROOT / "checkpoints"
@@ -40,7 +46,7 @@ CSV_IMAGE_COL = "image_path"
 CSV_TIMESTEP_COL = "timestep"
 
 # ---------- ACT model hyperparameters ----------
-CHUNK_SIZE = 100          # k: number of future actions predicted per inference
+CHUNK_SIZE = 30          # k: number of future actions predicted per inference
 HIDDEN_DIM = 512
 DIM_FEEDFORWARD = 3200
 ENC_LAYERS = 4
