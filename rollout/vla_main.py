@@ -126,6 +126,7 @@ def load_policy(args):
         if args.unfreeze_backbone
         else bool(ckpt_config.get("freeze_backbone", True))
     )
+    action_space = ckpt_config.get("action_space", C.DEFAULT_ACTION_SPACE)
     policy = build_vla_policy(
         stats=ckpt["stats"],
         vocabs=ckpt["vocabs"],
@@ -134,12 +135,14 @@ def load_policy(args):
         freeze_backbone=freeze_backbone,
         language_backend=language_backend,
         text_model_name=text_model,
+        action_space=action_space,
     ).to(device)
     policy.load_state_dict(ckpt["policy"])
     policy.eval()
     print(
         f"[microvla] loaded {checkpoint} "
-        f"(epoch={ckpt.get('epoch')}, backbone={backbone}, language={language_backend}, device={device})"
+        f"(epoch={ckpt.get('epoch')}, backbone={backbone}, language={language_backend}, "
+        f"action_space={action_space}, device={device})"
     )
     return policy
 

@@ -1,9 +1,15 @@
 torch>=2.0
 torchvision>=0.15
-numpy>=1.24,<2
+# numpy 2.x is required by lerobot>=0.4; MicroACT/MicroVLA are numpy-2 compatible.
+numpy>=1.24
 pandas>=2.0
 pillow>=10.0
 transformers>=4.40
+# Optional — only needed for the MicroVLA LeRobot dataset path (SmolVLA/OpenPI-style):
+#   data/lerobot_vla_dataset.py and dataset_vla/convert_microact_to_lerobot.py.
+# Pulls in huggingface_hub + datasets. Not needed for MicroACT or the legacy
+# dataset_vla/episodes loader.
+lerobot>=0.4
 # Optional — only needed for backbones that include "cellpose" / "cellpose4".
 # Cellpose 4 provides the Cellpose-SAM (`cpsam`) transformer used by the
 # `cellpose4` backbone. The legacy `cellpose` backbone still imports only

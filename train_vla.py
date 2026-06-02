@@ -11,6 +11,7 @@ from torch.utils.data import DataLoader, Subset
 
 from config import vla_config as C
 from data.vla_dataset import VocabBundle, build_vla_dataset
+from data.lerobot_vla_dataset import build_lerobot_vla_dataset
 from model.finetune import (
     apply_freeze_mode,
     apply_lora,
@@ -26,7 +27,17 @@ from utils import AverageMeter, build_optimizer, format_meters, set_seed
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train MicroVLA on heterogeneous micromanipulation data.")
-    p.add_argument("--episodes-dir", type=Path, default=C.VLA_EPISODES_DIR)
+    p.add_argument("--episodes-dir", type=Path, default=C.VLA_EPISODES_DIR,
+                   help="Legacy dataset_vla/episodes loader. Ignored if --dataset-repo-id is set.")
+    p.add_argument("--dataset-repo-id", type=str, default=None,
+                   help="LeRobot dataset repo id (SmolVLA/OpenPI-style). When set, MicroVLA trains "
+                        "from this LeRobot dataset instead of --episodes-dir.")
+    p.add_argument("--dataset-root", type=Path, default=None,
+                   help="Local root for the LeRobot dataset. Default: HF_LEROBOT_HOME/<repo-id>.")
+    p.add_argument("--action-space", choices=("delta", "absolute"), default=C.DEFAULT_ACTION_SPACE,
+                   help="Action representation for the LeRobot loader. 'delta' (relative to base "
+                        "state) is recommended; inference converts it back to absolute. The legacy "
+                        "episodes loader always uses absolute.")
     p.add_argument("--ckpt-dir", type=Path, default=C.VLA_CKPT_DIR)
     p.add_argument("--stats-path", type=Path, default=None)
     p.add_argument("--epochs", type=int, default=C.NUM_EPOCHS)
@@ -191,6 +202,8 @@ def save_vla_checkpoint(path: Path, policy, optimizer, epoch: int, best_val: flo
                 "backbone": args.backbone,
                 "language_backend": args.language_backend,
                 "text_model": args.text_model,
+                "action_space": args.action_space,
+                "dataset_repo_id": args.dataset_repo_id,
                 "pretrained_backbone": not args.no_pretrained,
                 "freeze_backbone": not args.unfreeze_backbone,
                 "freeze_mode": args.freeze_mode,
@@ -213,12 +226,38 @@ def main() -> None:
         print("[warn] CUDA unavailable, falling back to cpu")
         device = "cpu"
 
-    stats_path = args.stats_path or (args.ckpt_dir / "vla_stats.pkl")
-    full_ds = build_vla_dataset(
-        episodes_dir=args.episodes_dir,
-        stats_path=stats_path,
-        recompute_stats=True,
-    )
+    # Load a resume checkpoint early so the dataset is built with the SAME
+    # action space / dataset repo the run was started with.
+    resume_ckpt = None
+    if args.resume is not None and args.resume.exists():
+        resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        _rcfg0 = resume_ckpt.get("config", {})
+        if "action_space" in _rcfg0:
+            args.action_space = _rcfg0["action_space"]
+        if _rcfg0.get("dataset_repo_id") and args.dataset_repo_id is None:
+            args.dataset_repo_id = _rcfg0["dataset_repo_id"]
+
+    use_lerobot = args.dataset_repo_id is not None
+    if use_lerobot:
+        full_ds = build_lerobot_vla_dataset(
+            repo_id=args.dataset_repo_id,
+            root=args.dataset_root,
+            action_space=args.action_space,
+            chunk_size=C.CHUNK_SIZE,
+        )
+        print(f"loaded LeRobot dataset {args.dataset_repo_id} "
+              f"(robot_id={full_ds.episodes[0].robot_id!r}, action_space={args.action_space})")
+    else:
+        if args.action_space != "absolute":
+            print("[warn] legacy --episodes-dir loader trains on absolute actions; "
+                  "forcing --action-space absolute.")
+            args.action_space = "absolute"
+        stats_path = args.stats_path or (args.ckpt_dir / "vla_stats.pkl")
+        full_ds = build_vla_dataset(
+            episodes_dir=args.episodes_dir,
+            stats_path=stats_path,
+            recompute_stats=True,
+        )
     train_ds, val_ds, train_eps, val_eps = _episode_split(full_ds, args)
     val_names = [full_ds.episodes[i].episode_id for i in sorted(val_eps)]
     print(f"dataset: train={len(train_ds)} val={len(val_ds)} total={len(full_ds)}")
@@ -244,14 +283,11 @@ def main() -> None:
     #   * neither           : build from scratch on the new dataset.
     # If both --resume and --finetune are supplied, --resume wins.
     # ------------------------------------------------------------------
-    resume_ckpt = None
-    if args.resume is not None and args.resume.exists():
-        resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-
     if resume_ckpt is not None:
-        # Resume rebuilds the exact prior architecture.
+        # Resume rebuilds the exact prior architecture. (Checkpoint already
+        # loaded near the top so the dataset matched its action space.)
         rcfg = resume_ckpt.get("config", {})
-        for attr in ("freeze_mode", "lora_r", "lora_alpha", "lora_targets", "lora_dropout"):
+        for attr in ("freeze_mode", "lora_r", "lora_alpha", "lora_targets", "lora_dropout", "action_space"):
             if attr in rcfg:
                 setattr(args, attr, rcfg[attr])
         full_ds.vocabs = VocabBundle(**resume_ckpt["vocabs"])
@@ -264,6 +300,7 @@ def main() -> None:
             freeze_backbone=not args.unfreeze_backbone,
             language_backend=args.language_backend,
             text_model_name=args.text_model,
+            action_space=args.action_space,
         ).to(device)
         if args.freeze_mode != "none":
             apply_freeze_mode(policy, args.freeze_mode)
@@ -292,6 +329,7 @@ def main() -> None:
             freeze_backbone=not args.unfreeze_backbone,
             language_backend=args.language_backend,
             text_model_name=args.text_model,
+            action_space=args.action_space,
         ).to(device)
         load_finetune_state_dict(policy, pre["policy"], skip_patterns=("_table",))
         fill_robot_stats(policy, ext_vocabs, merged)
@@ -313,6 +351,7 @@ def main() -> None:
             freeze_backbone=not args.unfreeze_backbone,
             language_backend=args.language_backend,
             text_model_name=args.text_model,
+            action_space=args.action_space,
         ).to(device)
     print(
         f"backbone: {args.backbone}  language={args.language_backend}:{args.text_model}  "

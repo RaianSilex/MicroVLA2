@@ -43,6 +43,19 @@ LANGUAGE_BACKEND = "hf"          # "hf" for frozen Transformers, "simple" for of
 SIMPLE_TEXT_VOCAB_SIZE = 8192
 MAX_LANGUAGE_TOKENS = 32
 
+# ---------- LeRobot dataset (HF) ----------
+# MicroVLA can train from a LeRobot-format dataset (like SmolVLA / OpenPI / pi0)
+# instead of the local dataset_vla/episodes/ tree. The dataset is robot-native:
+# it stores ABSOLUTE Sensapex targets; the action space (delta vs absolute) is a
+# train-time transform chosen here / on the CLI. See data/lerobot_vla_dataset.py
+# and dataset_vla/convert_microact_to_lerobot.py.
+DEFAULT_DATASET_REPO_ID = "RaianSilex/microvla_ump_dataset"
+DEFAULT_ACTION_SPACE = "delta"   # "delta" (relative to base state) or "absolute"
+# Standard LeRobot feature keys (so smolvla/lerobot tooling can read the dataset).
+LEROBOT_CAMERA_KEY = "observation.images.cam_main"
+LEROBOT_STATE_KEY = "observation.state"
+LEROBOT_ACTION_KEY = "action"
+
 # Vocabulary fallback ids. Real ids are built from dataset metadata in
 # data/vla_dataset.py and saved into VLA checkpoints.
 UNKNOWN_TOKEN = "<unk>"

@@ -35,11 +35,16 @@ class VLAPolicy(nn.Module):
         stats: dict,
         vocabs,
         kl_weight: float = C.KL_WEIGHT,
+        action_space: str = C.DEFAULT_ACTION_SPACE,
         **vla_kwargs,
     ):
         super().__init__()
         self.vocabs = _coerce_vocabs(vocabs)
         self.kl_weight = float(kl_weight)
+        # "delta": predictions are relative to the base state and added back at
+        # inference so .inference() always returns ABSOLUTE targets (robot-native).
+        # "absolute": predictions are absolute targets directly.
+        self.action_space = str(action_space)
 
         vla_kwargs.setdefault("num_robot_ids", len(self.vocabs.robot_ids))
         vla_kwargs.setdefault("num_lab_ids", len(self.vocabs.lab_ids))
@@ -160,8 +165,8 @@ class VLAPolicy(nn.Module):
         action_mask = np.zeros(C.MAX_ACTION_DIM, dtype=bool)
         action_mask[:action_dim] = True
 
-        qpos_t = torch.from_numpy(qpos).to(device)
-        qpos_t = ((qpos_t - self.qpos_mean_table[rid]) / self.qpos_std_table[rid]).unsqueeze(0)
+        qpos_raw_t = torch.from_numpy(qpos).to(device)            # absolute, padded
+        qpos_t = ((qpos_raw_t - self.qpos_mean_table[rid]) / self.qpos_std_table[rid]).unsqueeze(0)
         state_mask_t = torch.from_numpy(state_mask).to(device).unsqueeze(0)
         action_mask_t = torch.from_numpy(action_mask).to(device).unsqueeze(0)
 
@@ -190,6 +195,9 @@ class VLAPolicy(nn.Module):
             action_mask=action_mask_t,
         )
         a = a_hat[0] * self.action_std_table[rid] + self.action_mean_table[rid]
+        if self.action_space == "delta":
+            # delta[i] is relative to the current base state -> recover absolute.
+            a[:, :action_dim] = a[:, :action_dim] + qpos_raw_t[:action_dim]
         return a[:, :action_dim].cpu().numpy().astype(np.float32)
 
     def _preprocess_image(self, img_np: np.ndarray) -> torch.Tensor:
@@ -208,6 +216,7 @@ def build_vla_policy(
     vocabs=None,
     stats_path: Path = C.VLA_STATS_PATH,
     kl_weight: float = C.KL_WEIGHT,
+    action_space: str = C.DEFAULT_ACTION_SPACE,
     **vla_kwargs,
 ) -> VLAPolicy:
     if stats is None or vocabs is None:
@@ -215,4 +224,6 @@ def build_vla_policy(
             payload = pickle.load(f)
         stats = payload["stats"] if stats is None else stats
         vocabs = payload["vocabs"] if vocabs is None else vocabs
-    return VLAPolicy(stats=stats, vocabs=vocabs, kl_weight=kl_weight, **vla_kwargs)
+    return VLAPolicy(
+        stats=stats, vocabs=vocabs, kl_weight=kl_weight, action_space=action_space, **vla_kwargs
+    )

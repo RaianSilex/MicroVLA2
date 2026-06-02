@@ -710,6 +710,15 @@ robots can use `state_dim=4` / `action_dim=4`; the loader pads to
 
 See `dataset_vla/README.md` for a minimal metadata example.
 
+**Recommended: LeRobot dataset on Hugging Face.** MicroVLA can instead train from
+a LeRobot-format dataset on the HF Hub — the same convention SmolVLA / OpenPI / π0
+use, so the dataset is robot-native and reusable by any VLA. Convert with
+`dataset_vla/convert_microact_to_lerobot.py` (which also injects varied,
+cell-position-grounded instructions), then train with `--dataset-repo-id`. The
+dataset stores **absolute** actions; training uses **delta** actions by default
+(`--action-space delta`) and inference converts them back to absolute, so the
+rollout/robot side is unchanged. Full details in `dataset_vla/README.md`.
+
 ### 12.2 Train VLA
 
 ```bash

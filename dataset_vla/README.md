@@ -66,3 +66,71 @@ The converter writes `dataset_vla/episodes/trial_N/metadata.json`,
 `trajectory.csv`, and `frames/cam_main/`. By default frames are symlinked, not
 copied, so the conversion does not duplicate the image dataset. Use
 `--frame-mode copy` if you need a standalone `dataset_vla/` tree.
+
+## LeRobot format on Hugging Face (recommended — SmolVLA / OpenPI / π0 style)
+
+MicroVLA can also train from a **LeRobot dataset** that lives on the HF Hub, the
+same convention SmolVLA, OpenPI and π0 use. This is the recommended path: the
+dataset is robot-native and reusable by any VLA.
+
+```bash
+# Build the LeRobot dataset locally under HF_LEROBOT_HOME (no push):
+python dataset_vla/convert_microact_to_lerobot.py
+
+# Quick subset for a smoke test:
+python dataset_vla/convert_microact_to_lerobot.py --limit-trials 3
+
+# Push to your HF account (needs `huggingface-cli login` first):
+python dataset_vla/convert_microact_to_lerobot.py --push-to-hub
+```
+
+What it produces (standard LeRobot v2/v3 schema, so `lerobot`/smolvla tooling
+reads it directly):
+
+- `observation.images.cam_main` — frame (PNG, letterboxed to 540×720 by default)
+- `observation.state` — 8-D absolute Sensapex state
+- `action` — 8-D **absolute** Sensapex target (robot-native; see action space below)
+- `task` — the per-trial instruction
+
+### Varied, grounded instructions
+
+The `task` string is built from the **target cell's position in the frame**, read
+from an editable labels file `dataset/instruction_labels.csv`
+(`trial_id,region,instruction`). The converter auto-scaffolds it (every trial
+defaulted to `center`) on the first run and prints a warning — **edit the
+`region` column** per trial, or write a free-text `instruction` to override, then
+re-run. Canonical regions are the 3×3 grid (`top_left, top, top_right, left,
+center, right, bottom_left, bottom, bottom_right`), and many natural aliases are
+accepted and normalized (`middle_left`/`middle_right` → `left`/`right`,
+`top_center` → `top`, `bottom_center` → `bottom`, `lower-right`, `upper-left`,
+`centre`, …). Wording is varied deterministically per trial so the
+language channel carries real signal (e.g. *"guide the pipettes to the cell in
+the top-left"*) instead of one constant prompt. If every trial stays `center`,
+language won't vary and the converter warns you.
+
+### Action space: absolute on disk, delta at train time
+
+The dataset stores **absolute** targets (matching the robot/ROS commands and
+`OpenPI Rollout/convert_data_to_lerobot.py`). Training converts them to **deltas**
+relative to the current state (`--action-space delta`, the default), which are
+small and workspace-translation invariant. At rollout `VLAPolicy.inference`
+converts the predicted delta **back to absolute**, so the ROS adapter and robot
+side never change. Use `--action-space absolute` to train on raw targets instead.
+
+### Train MicroVLA from the LeRobot dataset
+
+```bash
+# Offline smoke (no model downloads):
+python train_vla.py --dataset-repo-id RaianSilex/microvla_ump_dataset \
+  --action-space delta --backbone resnet18 --language-backend simple --no-pretrained \
+  --epochs 1 --batch-size 2 --num-workers 0
+
+# Real run (frozen DistilBERT + DINOv2 + Cellpose4):
+python train_vla.py --dataset-repo-id RaianSilex/microvla_ump_dataset \
+  --backbone dinov2_vits14+cellpose4 --language-backend hf
+```
+
+> Note: the dataset's `robot_type` (default `sensapex_dual_ump4`) is used as the
+> per-robot normalization key and **must match the rollout adapter's `robot_id`**.
+> OpenPI can consume this same dataset by pointing its data-config repack at the
+> `observation.state` / `action` / `observation.images.cam_main` keys.

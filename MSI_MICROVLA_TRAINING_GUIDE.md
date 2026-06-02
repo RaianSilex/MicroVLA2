@@ -603,6 +603,142 @@ to:
 --batch-size 1
 ```
 
+## 7A. (Recommended) Train From A LeRobot Dataset On Hugging Face
+
+Sections 4–7 read the local `dataset_vla/episodes/` tree. The **recommended**
+path instead trains from a **LeRobot dataset on Hugging Face** (SmolVLA / OpenPI
+/ π0 convention), so the dataset is robot-native and reusable by any VLA, and you
+never rsync the 26 GB raw dataset to MSI.
+
+The full laptop→MSI→local-inference walkthrough (building the dataset, the
+cell-position instruction labels, and running inference) is in
+**`MICROVLA_END_TO_END_GUIDE.md`**. The MSI-only steps:
+
+### 7A.1 Make sure the dataset is on HF and the repo/env are ready
+
+On your laptop you should have already run (see the end-to-end guide):
+
+```bash
+python dataset_vla/convert_microact_to_lerobot.py            # build locally
+python dataset_vla/convert_microact_to_lerobot.py --push-to-hub   # publish to HF
+```
+
+On MSI, confirm `lerobot` is installed and the repo is current:
+
+```bash
+cd /projects/standard/suhasabk/shared/MicroVLA
+module purge && module load conda
+source activate /projects/standard/suhasabk/shared/conda_envs/microvla
+python -c "import lerobot, data.lerobot_vla_dataset; print('lerobot path OK')"
+# if missing:  python -m pip install "lerobot>=0.4"
+```
+
+### 7A.2 Authenticate to Hugging Face on MSI (private dataset pull)
+
+Export the caches first (so the token and downloads land in project storage),
+then log in once on the login node — Slurm jobs reuse the cached token:
+
+```bash
+export HF_HOME=/projects/standard/suhasabk/shared/MicroVLA/.cache/huggingface
+export TORCH_HOME=/projects/standard/suhasabk/shared/MicroVLA/.cache/torch
+export CELLPOSE_LOCAL_MODELS_PATH=/projects/standard/suhasabk/shared/MicroVLA/.cache/cellpose
+mkdir -p "$HF_HOME" "$TORCH_HOME" "$CELLPOSE_LOCAL_MODELS_PATH"
+huggingface-cli login        # paste your HF token (or: export HF_TOKEN=hf_xxx in the job)
+```
+
+### 7A.3 Slurm script (`--dataset-repo-id`)
+
+```bash
+cd /projects/standard/suhasabk/shared/MicroVLA
+mkdir -p logs checkpoints_vla_lerobot
+
+cat > train_vla_lerobot.sbatch <<'EOF'
+#!/bin/bash -l
+#SBATCH --job-name=microvla-lerobot
+#SBATCH -p msigpu
+#SBATCH --gres=gpu:a100:1
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=100g
+#SBATCH --time=24:00:00
+#SBATCH --tmp=100g
+#SBATCH -o logs/%x-%j.out
+#SBATCH -e logs/%x-%j.err
+#SBATCH --mail-type=BEGIN,END,FAIL
+#SBATCH --mail-user=chowd207@umn.edu
+
+set -euo pipefail
+cd /projects/standard/suhasabk/shared/MicroVLA
+module purge && module load conda
+source activate /projects/standard/suhasabk/shared/conda_envs/microvla
+
+export HF_HOME=/projects/standard/suhasabk/shared/MicroVLA/.cache/huggingface
+export TORCH_HOME=/projects/standard/suhasabk/shared/MicroVLA/.cache/torch
+export CELLPOSE_LOCAL_MODELS_PATH=/projects/standard/suhasabk/shared/MicroVLA/.cache/cellpose
+mkdir -p "$HF_HOME" "$TORCH_HOME" "$CELLPOSE_LOCAL_MODELS_PATH"
+
+echo "Node: $(hostname)"; echo "Start: $(date)"; nvidia-smi
+
+REPO_ID="RaianSilex/microvla_ump_dataset"
+CKPT_DIR="/projects/standard/suhasabk/shared/MicroVLA/checkpoints_vla_lerobot"
+mkdir -p "$CKPT_DIR"
+
+# Optional speedup: if the dataset is already cached under $HF_HOME, stage it to
+# fast node-local storage and train from there. Otherwise it pulls from HF.
+DATASET_ROOT_ARG=()
+SRC="$HF_HOME/lerobot/$REPO_ID"
+if [[ -d "$SRC" ]]; then
+  JOB_DS="${TMPDIR:-/tmp/${USER}_${SLURM_JOB_ID}}/lerobot/$REPO_ID"
+  mkdir -p "$JOB_DS"; rsync -a --delete "$SRC/" "$JOB_DS/"
+  DATASET_ROOT_ARG=(--dataset-root "$JOB_DS")
+  echo "Training from node-local copy: $JOB_DS"
+fi
+
+RESUME_ARG=()
+[[ -f "$CKPT_DIR/vla_policy_last.pt" ]] && RESUME_ARG=(--resume "$CKPT_DIR/vla_policy_last.pt")
+
+python train_vla.py \
+  --dataset-repo-id "$REPO_ID" \
+  "${DATASET_ROOT_ARG[@]}" \
+  --action-space delta \
+  --backbone dinov2_vits14+cellpose4 \
+  --language-backend hf \
+  --text-model distilbert-base-uncased \
+  --epochs 2000 \
+  --batch-size 2 \
+  --num-workers 4 \
+  --device cuda \
+  --ckpt-dir "$CKPT_DIR" \
+  --save-every 100 \
+  "${RESUME_ARG[@]}"
+
+echo "End: $(date)"
+EOF
+
+sbatch train_vla_lerobot.sbatch
+```
+
+Notes:
+
+- **Smoke first:** swap the python args for
+  `--backbone resnet18 --language-backend simple --no-pretrained --epochs 1 --batch-size 8`.
+- **Action space:** `--action-space delta` (default, recommended) or `absolute`.
+  It is saved in the checkpoint and applied automatically at rollout — the robot
+  side always receives absolute targets.
+- **Resume** reuses the same script (auto-detects `vla_policy_last.pt`) and
+  rebuilds the exact prior backbone/action-space/LoRA from the checkpoint config.
+  Use a fresh `--ckpt-dir` per backbone — don't mix backbones in one dir.
+- **`robot_type` must match the rollout adapter's `robot_id`** (both
+  `sensapex_dual_ump4`), or normalization falls back to the UNKNOWN row.
+- **Offline alternative:** rsync your locally-built LeRobot dataset folder to MSI
+  and pass `--dataset-root <that folder>` (still pass `--dataset-repo-id`, used as
+  the per-robot stats key) — no HF pull at train time.
+
+Download the result back to your laptop exactly like the other modes (Section 11),
+using the `checkpoints_vla_lerobot/` folder. Then run inference locally per Stage 3
+of `MICROVLA_END_TO_END_GUIDE.md`.
+
 ## 8. Switch GPU Type If A100 Waits Too Long
 
 Do not run two jobs into the same checkpoint directory at once.
