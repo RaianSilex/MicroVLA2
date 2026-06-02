@@ -372,7 +372,7 @@ def main() -> None:
         )
         print(f"[push] done -> https://huggingface.co/datasets/{args.repo_id}")
     else:
-        print("[push] skipped (run with --push-to-hub, or use OpenPI Rollout/push_to_huggingface.py)")
+        print("[push] skipped (run with --push-to-hub, or use push_to_huggingface.py)")
 
 
 def parse_args() -> argparse.Namespace:

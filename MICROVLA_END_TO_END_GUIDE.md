@@ -152,16 +152,44 @@ Useful flags: `--limit-trials N` (quick test), `--down-h/--down-w` (image size),
 
 ### 1.5 Push to Hugging Face
 
+Use the Hugging Face CLI's resumable large-folder uploader for the built dataset.
+It is more reliable than a single `upload_folder` commit for multi-GB LeRobot
+datasets, and if it crashes or your network drops, re-run the exact same command.
+
 ```bash
-huggingface-cli login            # paste your write token (once per machine)
-python dataset_vla/convert_microact_to_lerobot.py --push-to-hub
+hf auth login            # paste your write token (once per machine)
+
+hf upload-large-folder \
+  RaianSilex/microvla_ump_dataset \
+  ~/.cache/huggingface/lerobot/RaianSilex/microvla_ump_dataset \
+  --repo-type dataset \
+  --private \
+  --num-workers 2
 ```
 
-The dataset is pushed **private**. Verify at
+If the upload stalls or exits midway, retry:
+
+```bash
+hf upload-large-folder \
+  RaianSilex/microvla_ump_dataset \
+  ~/.cache/huggingface/lerobot/RaianSilex/microvla_ump_dataset \
+  --repo-type dataset \
+  --private \
+  --num-workers 1
+```
+
+`--num-workers 1` is slower but gentler on unstable connections. The dataset is
+pushed **private** when the repo is created. Verify at
 `https://huggingface.co/datasets/RaianSilex/microvla_ump_dataset`.
 
-> Alternative push of an already-built dataset:
-> `python "OpenPI Rollout/push_to_huggingface.py" --local-dir ~/.cache/huggingface/lerobot/RaianSilex/microvla_ump_dataset --repo-id RaianSilex/microvla_ump_dataset --repo-type dataset --private`
+Re-uploading to the same dataset repo overwrites files with the same path and
+adds new files, but it does not delete old files that are absent locally. If the
+local folder structure changed and you need a clean replacement, delete/recreate
+the dataset repo on Hugging Face first or upload to a new repo id.
+
+Avoid the `push_to_huggingface.py` helper for this large dataset
+unless you specifically need it; it uses the normal `upload_folder` API, which is
+less resilient for large resumable uploads.
 
 ---
 
@@ -444,8 +472,10 @@ controllers are unchanged.
 python dataset_vla/convert_microact_to_lerobot.py --limit-trials 1   # scaffold labels
 #   ... edit dataset/instruction_labels.csv ...
 python dataset_vla/convert_microact_to_lerobot.py                    # build all
-huggingface-cli login
-python dataset_vla/convert_microact_to_lerobot.py --push-to-hub      # publish
+hf auth login
+hf upload-large-folder RaianSilex/microvla_ump_dataset \
+  ~/.cache/huggingface/lerobot/RaianSilex/microvla_ump_dataset \
+  --repo-type dataset --private --num-workers 2
 
 # 2. MSI: train (after env setup + huggingface-cli login)
 sbatch train_vla_lerobot.sbatch

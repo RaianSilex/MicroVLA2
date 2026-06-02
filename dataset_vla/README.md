@@ -110,8 +110,8 @@ language won't vary and the converter warns you.
 
 ### Action space: absolute on disk, delta at train time
 
-The dataset stores **absolute** targets (matching the robot/ROS commands and
-`OpenPI Rollout/convert_data_to_lerobot.py`). Training converts them to **deltas**
+The dataset stores **absolute** targets (matching the robot/ROS commands).
+Training converts them to **deltas**
 relative to the current state (`--action-space delta`, the default), which are
 small and workspace-translation invariant. At rollout `VLAPolicy.inference`
 converts the predicted delta **back to absolute**, so the ROS adapter and robot
@@ -132,5 +132,49 @@ python train_vla.py --dataset-repo-id RaianSilex/microvla_ump_dataset \
 
 > Note: the dataset's `robot_type` (default `sensapex_dual_ump4`) is used as the
 > per-robot normalization key and **must match the rollout adapter's `robot_id`**.
-> OpenPI can consume this same dataset by pointing its data-config repack at the
-> `observation.state` / `action` / `observation.images.cam_main` keys.
+> OpenPI uses the same `observation.state` / `action` / `observation.images.cam_main`
+> keys, but needs a **v2.1** copy of the dataset — see the next section.
+
+### OpenPI / pi0 / pi0.5: build a v2.1 copy
+
+OpenPI's training pipeline pins an older `lerobot` and **does not support the v3.0
+dataset format** that `convert_microact_to_lerobot.py` produces. SmolVLA and
+MicroVLA read v3.0 natively; OpenPI needs **v2.1**. Build a separate v2.1 copy with
+`convert_microact_to_lerobot_v21.py` — same content and same instruction/region
+logic, only the on-disk format differs (it defaults to a new repo id,
+`<v3.0 id>_v21`, so it never clobbers the v3.0 dataset).
+
+The on-disk version is decided by the *installed* `lerobot`, not the script:
+`lerobot 0.3.x` writes v2.1; `lerobot >= 0.4` writes v3.0. So run it in a **separate
+venv** (keep your main env on `lerobot>=0.4` for MicroVLA/SmolVLA):
+
+```bash
+python3 -m venv .lerobot-v21-venv
+source .lerobot-v21-venv/bin/activate
+pip install "lerobot==0.3.3"
+
+# build locally -> RaianSilex/microvla_ump_dataset_v21:
+python dataset_vla/convert_microact_to_lerobot_v21.py
+# quick smoke (3 trials):
+python dataset_vla/convert_microact_to_lerobot_v21.py --limit-trials 3
+```
+
+The script reads back the format `LeRobotDataset.create` actually wrote and aborts
+if it is not v2.x, so you can't accidentally produce v3.0.
+
+Push it (after `huggingface-cli login` with a write token):
+
+```bash
+# A) push during the build (private):
+python dataset_vla/convert_microact_to_lerobot_v21.py --push-to-hub
+
+# B) or build first, then push the local folder:
+python push_to_huggingface.py \
+  --local-dir ~/.cache/huggingface/lerobot/RaianSilex/microvla_ump_dataset_v21 \
+  --repo-id RaianSilex/microvla_ump_dataset_v21 --repo-type dataset --private
+```
+
+Action representation is still **absolute on disk**. To match MicroVLA's delta in
+OpenPI, enable its `DeltaActions` transform (per-dimension mask) so actions are
+predicted relative to the current state and converted back to absolute at inference,
+and compute OpenPI's norm stats *after* that transform.

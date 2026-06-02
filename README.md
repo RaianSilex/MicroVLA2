@@ -105,8 +105,6 @@ MicroACT/
 ├── utils.py                      seeding, optimizer, checkpoint IO, meters
 ├── evaluate.py                   intentionally empty (offline sanity script TODO)
 ├── export_onnx.py                exports model to ONNX (for Netron viewing)
-├── viz_torchviz.py               renders autograd-graph SVGs
-├── viz_summary.py                Keras-style layer summary table
 ├── requirements.txt
 └── README.md                     this file
 ```
@@ -124,8 +122,6 @@ MicroACT/
 | `train.py` | CLI entry point. Builds dataset, splits train/val, builds policy + AdamW, runs the train/val/checkpoint loop. |
 | `utils.py` | `set_seed`, `build_optimizer` (two-group AdamW), `save_checkpoint`/`load_checkpoint`, `AverageMeter`. |
 | `export_onnx.py` | Exports inference + training graphs to ONNX so you can drag them into [Netron](https://netron.app). |
-| `viz_torchviz.py` | Renders autograd-graph SVGs at four scopes (backbone, style encoder, full inference, full training). |
-| `viz_summary.py` | Prints a Keras-style layer table — every named layer, output shape, param count. Most scannable. |
 
 ---
 
@@ -567,23 +563,14 @@ MicroACT.
 
 ## 9. Visualizing the Architecture
 
-Three tools, picked by purpose:
+`export_onnx.py` produces a Netron-loadable `.onnx` for answering "how do the
+modules connect?" — a clickable architecture diagram.
 
-| Tool | Output | Best for |
-|---|---|---|
-| `viz_summary.py` | ~300 lines text | "What layers exist? What sizes? How many params?" |
-| `export_onnx.py` | Netron-loadable `.onnx` | "How do the modules connect?" — clickable architecture diagram |
-| `viz_torchviz.py` | 4× SVG (~2.5 MB total) | "Why is this gradient zero?" — debugging gradient flow |
-
-All three accept the same `--backbone` flag and write to per-backbone subdirectories
-(`onnx_exports/<backbone>/`, `torchviz_exports/<backbone>/`).
+It accepts the same `--backbone` flag as training and writes to a per-backbone
+subdirectory (`onnx_exports/<backbone>/`).
 
 ```bash
-pip install torchinfo torchviz       # graphviz system pkg also required for torchviz
-
-python viz_summary.py --backbone dinov2_vits14+cellpose4 > arch_dual.txt
 python export_onnx.py --backbone dinov2_vits14+cellpose4
-python viz_torchviz.py --backbone dinov2_vits14+cellpose4
 ```
 
 For Netron: drag `onnx_exports/<backbone>/act_inference.onnx` into
