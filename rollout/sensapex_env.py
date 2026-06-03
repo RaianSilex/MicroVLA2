@@ -12,6 +12,7 @@ absolute target commands.
 from __future__ import annotations
 
 import io
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -84,7 +85,13 @@ class _SensapexROSNode(Node):
             self._frame_counter += 1
             if self._frame_counter % self._preview_every_n_frames == 0:
                 try:
-                    PILImage.fromarray(rgb).save(self._preview_path)
+                    # Write to a temp file then atomically replace, so a reader
+                    # (or a killed process) never sees a half-written PNG. Keep
+                    # the real extension so PIL can infer the format.
+                    root, ext = os.path.splitext(self._preview_path)
+                    tmp_path = f"{root}.tmp{ext}"
+                    PILImage.fromarray(rgb).save(tmp_path)
+                    os.replace(tmp_path, self._preview_path)
                 except Exception as e:
                     self.get_logger().warn(f"Preview save failed: {e}")
 

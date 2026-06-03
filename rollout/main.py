@@ -41,24 +41,24 @@ except ImportError:  # pragma: no cover - direct script execution fallback
 # Units are centered Sensapex counts, matching /ump/live and /ump2/live.
 # Edit these before running on a different workspace.
 
-X1_MIN, X1_MAX = 4600, 5700
-Y1_MIN, Y1_MAX = 4900, 5500
-Z1_MIN, Z1_MAX = 8750, 8250
-D1_MIN, D1_MAX = 5900, 6100
+X1_MIN, X1_MAX = 17634, 18944
+Y1_MIN, Y1_MAX = 17362, 18362
+Z1_MIN, Z1_MAX = 14390, 14410
+D1_MIN, D1_MAX = 15618, 15638
 
-X2_MIN, X2_MAX = 4600, 5700
-Y2_MIN, Y2_MAX = 4900, 5500
-Z2_MIN, Z2_MAX = 8750, 8250
-D2_MIN, D2_MAX = 5900, 6100
+X2_MIN, X2_MAX = 10915, 12230
+Y2_MIN, Y2_MAX = 10179, 11209
+Z2_MIN, Z2_MAX = 18269, 18289
+D2_MIN, D2_MAX = 12953, 12933
 
-MAX_DX1 = 250.0
-MAX_DY1 = 250.0
-MAX_DZ1 = 250.0
-MAX_DD1 = 250.0
-MAX_DX2 = 250.0
-MAX_DY2 = 250.0
-MAX_DZ2 = 250.0
-MAX_DD2 = 250.0
+MAX_DX1 = 50.0
+MAX_DY1 = 50.0
+MAX_DZ1 = 50.0
+MAX_DD1 = 50.0
+MAX_DX2 = 50.0
+MAX_DY2 = 50.0
+MAX_DZ2 = 50.0
+MAX_DD2 = 50.0
 
 
 def _resolve_repo_path(path: Path) -> Path:

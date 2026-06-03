@@ -115,7 +115,7 @@ class ACTPolicy(nn.Module):
             )
             img_np = np.array(pil)                          # copy so torch can own it
         x = torch.from_numpy(img_np).float() / 255.0        # (H, W, 3)
-        x = x.permute(2, 0, 1)                              # (3, H, W)
+        x = x.permute(2, 0, 1).to(self.image_mean.device)  # (3, H, W), match buffer device
         x = (x - self.image_mean) / self.image_std
         return x.unsqueeze(0)                               # (num_cam=1, 3, H, W)
 

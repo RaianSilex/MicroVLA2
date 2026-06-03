@@ -91,11 +91,16 @@ def _dataset_codebase_version(ds) -> str:
 
 
 def _finalize(ds) -> None:
-    """v2.1 lerobot finishes a dataset with consolidate(); v3.0 renamed it finalize()."""
+    """Finish writing the dataset.
+
+    Older lerobot (0.1/0.2) finished with consolidate(); v3.0 (0.4.x) renamed it
+    finalize(). lerobot 0.3.x (which writes the v2.1 format we want here) writes
+    each episode incrementally in save_episode() and exposes NEITHER method, so in
+    that case there is nothing left to do.
+    """
     fn = getattr(ds, "consolidate", None) or getattr(ds, "finalize", None)
-    if fn is None:
-        raise RuntimeError("LeRobotDataset has neither consolidate() nor finalize().")
-    fn()
+    if fn is not None:
+        fn()
 
 
 def main() -> None:
@@ -202,12 +207,17 @@ def main() -> None:
                 )
             img = _load_rgb_uint8(src)
             img = (_resize_letterbox(img, *out_hw) if args.keep_aspect else _resize_exact(img, *out_hw))
-            ds.add_frame({
+            frame = {
                 C.LEROBOT_CAMERA_KEY: img,
                 C.LEROBOT_STATE_KEY: states[t],
                 C.LEROBOT_ACTION_KEY: actions[t],
-                "task": instruction,
-            })
+            }
+            try:
+                # lerobot 0.3.x (v2.1): task is a separate positional argument.
+                ds.add_frame(frame, task=instruction)
+            except TypeError:
+                # lerobot 0.4.x (v3.0): task is a key inside the frame dict.
+                ds.add_frame({**frame, "task": instruction})
             wrote += 1
         ds.save_episode()
         total_rows += wrote
