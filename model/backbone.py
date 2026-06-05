@@ -590,13 +590,34 @@ class Backbone(nn.Module):
         primary_name = self.primary_name if self.is_dual else self.backbone_name
         return self._encoder_feat(primary_name, x)
 
-    def forward(self, x: torch.Tensor):
+    @torch.no_grad()
+    def encode_raw(self, x: torch.Tensor):
+        """Raw frozen-encoder features, before the trainable projections.
+
+        Returns ``(primary_feat, aux_feat | None)`` — exactly the tensors that
+        ``forward`` would otherwise compute internally via ``self._primary_feat``
+        / ``self._encoder_feat``. These are constant per frame while the
+        encoders are frozen, so they can be precomputed and cached; see
+        ``data/feature_cache.py``. ``forward(x, primary_feat=..., aux_feat=...)``
+        consumes them and runs only the trainable projection path.
+        """
+        feat_p = self._primary_feat(x)
+        feat_a = self._encoder_feat(self.aux_name, x) if self.is_dual else None
+        return feat_p, feat_a
+
+    def forward(self, x: torch.Tensor, primary_feat: torch.Tensor = None,
+                aux_feat: torch.Tensor = None):
         """
         Single mode → returns (feat, pos), both (B, hidden_dim, Hp, Wp).
         Dual   mode → returns (tokens, pos_tokens), both (S, B, hidden_dim).
+
+        ``primary_feat`` / ``aux_feat``, when given, are precomputed raw encoder
+        outputs (see ``encode_raw``); the frozen encoders are then skipped and
+        ``x`` may be ``None``. The trainable projection / type-embedding / pos
+        path still runs, so gradients are identical to the uncached path.
         """
-        # Primary encoder
-        feat_p = self._primary_feat(x)
+        # Primary encoder (skipped if a cached feature map is supplied).
+        feat_p = primary_feat if primary_feat is not None else self._primary_feat(x)
         feat_p = self.input_proj(feat_p)
         pos_p = self.pos_embed(feat_p)
 
@@ -605,7 +626,7 @@ class Backbone(nn.Module):
 
         # Auxiliary encoder. Pool only if the feature grid is large enough;
         # Cellpose 4 with diameter scaling can already be very compact.
-        feat_a = self._encoder_feat(self.aux_name, x)
+        feat_a = aux_feat if aux_feat is not None else self._encoder_feat(self.aux_name, x)
         if min(feat_a.shape[-2:]) >= 16:
             feat_a = self.aux_pool(feat_a)
         feat_a = self.input_proj_aux(feat_a)                  # (B, D, h, w)

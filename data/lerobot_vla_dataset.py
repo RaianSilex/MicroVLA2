@@ -150,6 +150,11 @@ class LeRobotVLADataset(Dataset):
         self.state_dim = states_all.shape[1]
         self.action_dim = actions_all.shape[1]
 
+        # Optional FeatureCache (set externally by the trainer). When present,
+        # __getitem__ returns precomputed raw encoder features instead of
+        # decoding + resizing the frame, removing the per-step video decode.
+        self.feature_cache = None
+
         self.index = [(ei, t) for ei, ep in enumerate(episodes) for t in range(ep.length)]
 
         self._image_mean = torch.from_numpy(stats["image_mean"]).view(3, 1, 1)
@@ -225,8 +230,7 @@ class LeRobotVLADataset(Dataset):
         qpos_n[~state_mask] = 0.0
 
         ids = self._ids[ei]
-        return {
-            "image": self._load_image(g).float(),
+        sample = {
             "qpos": torch.from_numpy(qpos_n).float(),
             "state_mask": torch.from_numpy(state_mask),
             "action": torch.from_numpy(action_n).float(),
@@ -241,6 +245,15 @@ class LeRobotVLADataset(Dataset):
             "episode_index": torch.tensor(ei, dtype=torch.long),
             "timestep": torch.tensor(t, dtype=torch.long),
         }
+        if self.feature_cache is not None:
+            # Cached raw encoder features → no video decode this step.
+            primary_feat, aux_feat = self.feature_cache.get(g)
+            sample["primary_feat"] = primary_feat
+            if aux_feat is not None:
+                sample["aux_feat"] = aux_feat
+        else:
+            sample["image"] = self._load_image(g).float()
+        return sample
 
 
 def build_lerobot_vla_dataset(

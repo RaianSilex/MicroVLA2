@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 
 import torch
@@ -12,6 +13,7 @@ from torch.utils.data import DataLoader, Subset
 from config import vla_config as C
 from data.vla_dataset import VocabBundle, build_vla_dataset
 from data.lerobot_vla_dataset import build_lerobot_vla_dataset
+from data.feature_cache import FeatureCache
 from model.finetune import (
     apply_freeze_mode,
     apply_lora,
@@ -53,6 +55,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--save-every", type=int, default=100)
     p.add_argument("--resume", type=Path, default=None)
+    p.add_argument(
+        "--cache-features", action="store_true",
+        help="Precompute and memmap the frozen image-encoder features once, then "
+             "train on the cache. Removes the per-step video decode and the frozen "
+             "ViT forward passes. Only valid with a frozen backbone (ignored if "
+             "--unfreeze-backbone is set).",
+    )
+    p.add_argument(
+        "--feature-cache-dir", type=Path, default=None,
+        help="Where to store/read the feature cache. Default: "
+             "<ckpt-dir>/feat_cache_<backbone>. Put this on fast node-local "
+             "storage ($TMPDIR) for best throughput.",
+    )
+    p.add_argument(
+        "--precompute-batch", type=int, default=32,
+        help="Batch size for the one-time feature-cache precompute pass.",
+    )
+    p.add_argument(
+        "--amp", action="store_true",
+        help="Run the forward pass under bf16 autocast (A100/H100). Speeds up "
+             "training and lowers memory; loss/backward stay in fp32.",
+    )
     p.add_argument(
         "--backbone",
         type=str,
@@ -123,12 +147,14 @@ def _episode_split(full_ds, args):
     return Subset(full_ds, train_idx), Subset(full_ds, val_idx), train_episode_ids, val_episode_ids
 
 
-def run_epoch(policy, loader, optimizer, device, train: bool) -> dict:
+def run_epoch(policy, loader, optimizer, device, train: bool, amp: bool = False) -> dict:
     policy.train(train)
     meters: dict = defaultdict(AverageMeter)
 
+    use_amp = amp and str(device).startswith("cuda")
+    amp_ctx = (lambda: torch.autocast("cuda", dtype=torch.bfloat16)) if use_amp else nullcontext
+
     for batch in loader:
-        image = batch["image"].to(device, non_blocking=True)
         qpos = batch["qpos"].to(device, non_blocking=True)
         state_mask = batch["state_mask"].to(device, non_blocking=True)
         action = batch["action"].to(device, non_blocking=True)
@@ -141,7 +167,20 @@ def run_epoch(policy, loader, optimizer, device, train: bool) -> dict:
         task_family_id = batch["task_family_id"].to(device, non_blocking=True)
         instructions = batch["instruction"]
 
-        if train:
+        # Either raw frames (decode path) or cached frozen-encoder features.
+        if "primary_feat" in batch:
+            image = None
+            img_primary_feat = batch["primary_feat"].to(device, non_blocking=True)
+            img_aux_feat = (
+                batch["aux_feat"].to(device, non_blocking=True)
+                if "aux_feat" in batch else None
+            )
+        else:
+            image = batch["image"].to(device, non_blocking=True)
+            img_primary_feat = img_aux_feat = None
+
+        grad_ctx = nullcontext() if train else torch.no_grad()
+        with grad_ctx, amp_ctx():
             loss_dict = policy(
                 image,
                 qpos,
@@ -155,26 +194,14 @@ def run_epoch(policy, loader, optimizer, device, train: bool) -> dict:
                 action_mask=action_mask,
                 actions=action,
                 is_pad=is_pad,
+                img_primary_feat=img_primary_feat,
+                img_aux_feat=img_aux_feat,
             )
+
+        if train:
             optimizer.zero_grad()
             loss_dict["loss"].backward()
             optimizer.step()
-        else:
-            with torch.no_grad():
-                loss_dict = policy(
-                    image,
-                    qpos,
-                    instructions,
-                    robot_id,
-                    lab_id,
-                    embodiment_id,
-                    action_type_id,
-                    task_family_id,
-                    state_mask=state_mask,
-                    action_mask=action_mask,
-                    actions=action,
-                    is_pad=is_pad,
-                )
 
         bs = qpos.size(0)
         for k, v in loss_dict.items():
@@ -357,6 +384,44 @@ def main() -> None:
         f"backbone: {args.backbone}  language={args.language_backend}:{args.text_model}  "
         f"freeze={args.freeze_mode}  lora_r={args.lora_r}  {parameter_summary(policy)}"
     )
+
+    # ------------------------------------------------------------------
+    # Optional frozen-encoder feature cache. Precompute the raw image-encoder
+    # features once, then every training step skips the per-frame video decode
+    # AND the frozen ViT forward passes. Only valid while the encoders stay
+    # frozen (disabled under --unfreeze-backbone).
+    # ------------------------------------------------------------------
+    if args.cache_features:
+        if args.unfreeze_backbone:
+            print("[feature-cache] --unfreeze-backbone is set; encoder outputs "
+                  "change during training, so the cache would be stale. Disabling.")
+        elif not use_lerobot:
+            print("[feature-cache] only supported for the LeRobot loader "
+                  "(--dataset-repo-id); disabling.")
+        else:
+            cache_dir = args.feature_cache_dir or (
+                args.ckpt_dir
+                / f"feat_cache_{args.backbone.replace('+', '_').replace('/', '_')}"
+            )
+            image_hw = (C.IMAGE_HEIGHT, C.IMAGE_WIDTH)
+            num_frames = int(full_ds.states_all.shape[0])
+            feat_cache = FeatureCache.load_if_valid(
+                cache_dir,
+                repo_id=args.dataset_repo_id,
+                backbone_name=args.backbone,
+                image_hw=image_hw,
+                num_frames=num_frames,
+            )
+            if feat_cache is None:
+                feat_cache = FeatureCache.build(
+                    cache_dir, full_ds, policy, device,
+                    repo_id=args.dataset_repo_id,
+                    backbone_name=args.backbone,
+                    image_hw=image_hw,
+                    batch_size=args.precompute_batch,
+                )
+            full_ds.feature_cache = feat_cache
+
     optimizer = build_optimizer(policy, args.lr, args.lr_backbone, args.weight_decay)
 
     ckpt_last = args.ckpt_dir / "vla_policy_last.pt"
@@ -377,8 +442,8 @@ def main() -> None:
         print(f"resumed at epoch {start_epoch}; best_val={best_val:.4f}")
 
     for epoch in range(start_epoch, args.epochs):
-        tr = run_epoch(policy, train_loader, optimizer, device, train=True)
-        vl = run_epoch(policy, val_loader, optimizer, device, train=False)
+        tr = run_epoch(policy, train_loader, optimizer, device, train=True, amp=args.amp)
+        vl = run_epoch(policy, val_loader, optimizer, device, train=False, amp=args.amp)
 
         print(
             f"[epoch {epoch+1:4d}/{args.epochs}] "

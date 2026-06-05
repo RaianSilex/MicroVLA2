@@ -119,10 +119,21 @@ class VLACVAE(nn.Module):
         out = self.style_encoder(seq, src_key_padding_mask=pad_mask, pos=pos)
         return self.latent_proj(out[0]).chunk(2, dim=-1)
 
-    def _encode_image(self, image: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        B, N = image.shape[:2]
-        flat = image.flatten(0, 1)
-        feat, pos = self.backbone(flat)
+    def _encode_image(
+        self,
+        image: Optional[torch.Tensor],
+        primary_feat: Optional[torch.Tensor] = None,
+        aux_feat: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if primary_feat is not None:
+            # Cached raw encoder features (single-camera). Skip the frozen
+            # encoders; the backbone still runs its trainable projection path.
+            B, N = primary_feat.shape[0], self.num_cameras
+            feat, pos = self.backbone(None, primary_feat=primary_feat, aux_feat=aux_feat)
+        else:
+            B, N = image.shape[:2]
+            flat = image.flatten(0, 1)
+            feat, pos = self.backbone(flat)
         if feat.dim() == 4:
             D, Hp, Wp = feat.shape[1:]
             feat = feat.view(B, N, D, Hp, Wp).permute(0, 2, 1, 3, 4).flatten(2)
@@ -150,6 +161,8 @@ class VLACVAE(nn.Module):
         action_mask: Optional[torch.Tensor] = None,
         actions: Optional[torch.Tensor] = None,
         is_pad: Optional[torch.Tensor] = None,
+        img_primary_feat: Optional[torch.Tensor] = None,
+        img_aux_feat: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         B = qpos.size(0)
         device = qpos.device
@@ -167,7 +180,7 @@ class VLACVAE(nn.Module):
             logvar = torch.zeros(B, self.latent_dim, device=device)
             z = torch.zeros(B, self.latent_dim, device=device)
 
-        img_feat, img_pos = self._encode_image(image)
+        img_feat, img_pos = self._encode_image(image, img_primary_feat, img_aux_feat)
         lang_tokens, lang_pad = self.language_encoder(instructions)
         meta_tokens = self.embodiment(
             robot_id, lab_id, embodiment_id, action_type_id, task_family_id

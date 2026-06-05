@@ -87,6 +87,8 @@ class VLAPolicy(nn.Module):
         action_mask: Optional[torch.Tensor] = None,
         actions: Optional[torch.Tensor] = None,
         is_pad: Optional[torch.Tensor] = None,
+        img_primary_feat: Optional[torch.Tensor] = None,
+        img_aux_feat: Optional[torch.Tensor] = None,
     ):
         if actions is not None:
             if action_mask is None or is_pad is None:
@@ -104,6 +106,8 @@ class VLAPolicy(nn.Module):
                 action_mask=action_mask,
                 actions=actions,
                 is_pad=is_pad,
+                img_primary_feat=img_primary_feat,
+                img_aux_feat=img_aux_feat,
             )
             return self._compute_loss(a_hat, actions, is_pad, action_mask, mu, logvar)
 
@@ -118,6 +122,8 @@ class VLAPolicy(nn.Module):
             task_family_id,
             state_mask=state_mask,
             action_mask=action_mask,
+            img_primary_feat=img_primary_feat,
+            img_aux_feat=img_aux_feat,
         )
         return a_hat
 
