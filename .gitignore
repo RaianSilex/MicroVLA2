@@ -57,3 +57,8 @@ Thumbs.db
 
 # Tooling caches
 .codex
+
+# transient runtime artifacts
+.claude/
+microact_live.png
+microact_live.tmp.png
