@@ -212,7 +212,7 @@ class VLAPolicy(nn.Module):
             pil = Image.fromarray(img_np).resize((C.IMAGE_WIDTH, C.IMAGE_HEIGHT), Image.BILINEAR)
             img_np = np.array(pil)
         x = torch.from_numpy(img_np).float() / 255.0
-        x = x.permute(2, 0, 1)
+        x = x.permute(2, 0, 1).to(self.image_mean.device)
         x = (x - self.image_mean) / self.image_std
         return x.unsqueeze(0)
 
