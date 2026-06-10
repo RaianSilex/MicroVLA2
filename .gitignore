@@ -43,6 +43,7 @@ torchviz_exports/
 dataset/saved_frames/
 dataset/saved_videos/
 dataset/logs/
+dataset/instruction_labels.csv
 
 # Editor / IDE
 .vscode/
