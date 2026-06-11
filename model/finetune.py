@@ -6,7 +6,7 @@ Typical workflow:
     pre_vocabs = VocabBundle(**pretrained_ckpt["vocabs"])
     pre_stats = pretrained_ckpt["stats"]
 
-    new_ds = build_vla_dataset(...)                        # finetuner's data
+    new_ds = build_lerobot_vla_dataset(repo_id=...)        # finetuner's data
     ext_vocabs = extend_vocabs(pre_vocabs, new_ds.episodes)
     merged = merge_stats(pre_stats, new_ds.stats)
 

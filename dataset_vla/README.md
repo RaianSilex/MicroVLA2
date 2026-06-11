@@ -1,77 +1,14 @@
-# MicroVLA Dataset Layout
+# MicroVLA Dataset (LeRobot format)
 
-Place heterogeneous demonstrations under:
+MicroVLA trains from a **LeRobot dataset** on the Hugging Face Hub — the same
+convention SmolVLA, OpenPI and π0 use. Build one from your raw MicroACT data
+(`dataset/` = `logs/trial_N.csv` + `saved_frames/trial_N/`) with the converters
+in this folder. The dataset is robot-native and reusable by any VLA.
 
-```text
-dataset_vla/
-└── episodes/
-    └── <episode_id>/
-        ├── metadata.json
-        ├── trajectory.csv
-        └── frames/
-            └── cam_main/
-                ├── frame_000000.png
-                └── frame_000001.png
-```
-
-Minimal `metadata.json`:
-
-```json
-{
-  "episode_id": "lab_a_trial_0001",
-  "lab_id": "lab_a",
-  "robot_id": "sensapex_dual_ump4",
-  "embodiment": "dual_manipulator",
-  "action_type": "absolute_position",
-  "task_family": "cell_manipulation",
-  "instruction": "move both manipulators toward the selected cell",
-  "camera_names": ["cam_main"],
-  "state_dim": 8,
-  "action_dim": 8,
-  "state_cols": [
-    "current_x", "current_y", "current_z", "current_d",
-    "current_x2", "current_y2", "current_z2", "current_d2"
-  ],
-  "action_cols": [
-    "target_x", "target_y", "target_z", "target_d",
-    "target_x2", "target_y2", "target_z2", "target_d2"
-  ],
-  "image_col": "image_path",
-  "timestep_col": "timestep"
-}
-```
-
-Single-manipulator episodes can use `state_dim: 4` and `action_dim: 4`.
-The loader pads all state/action tensors to the shared VLA maximums and masks
-invalid dimensions during loss computation.
-
-## Convert an existing MicroACT dataset
-
-If you already have the classic MicroACT layout:
-
-```text
-dataset/
-├── logs/trial_N.csv
-└── saved_frames/trial_N/frame_000000.png
-```
-
-convert it before running `train_vla.py`:
-
-```bash
-python3 dataset_vla/convert_microact_to_vla.py \
-  --replace-zero-targets-with-state
-```
-
-The converter writes `dataset_vla/episodes/trial_N/metadata.json`,
-`trajectory.csv`, and `frames/cam_main/`. By default frames are symlinked, not
-copied, so the conversion does not duplicate the image dataset. Use
-`--frame-mode copy` if you need a standalone `dataset_vla/` tree.
-
-## LeRobot format on Hugging Face (recommended — SmolVLA / OpenPI / π0 style)
-
-MicroVLA can also train from a **LeRobot dataset** that lives on the HF Hub, the
-same convention SmolVLA, OpenPI and π0 use. This is the recommended path: the
-dataset is robot-native and reusable by any VLA.
+> The older `dataset_vla/episodes/` intermediate format (and its
+> `convert_microact_to_vla.py` converter) was removed — MicroVLA reads LeRobot
+> datasets directly now. For the full end-to-end upload recipe (v2.1 + v3, HF
+> auth, parallel builds) see [../HUGGINGFACE_LEROBOT_UPLOAD.md](../HUGGINGFACE_LEROBOT_UPLOAD.md).
 
 ```bash
 # Build the LeRobot dataset locally under HF_LEROBOT_HOME (no push):
@@ -84,13 +21,18 @@ python dataset_vla/convert_microact_to_lerobot.py --limit-trials 3
 python dataset_vla/convert_microact_to_lerobot.py --push-to-hub
 ```
 
-What it produces (standard LeRobot v2/v3 schema, so `lerobot`/smolvla tooling
+What it produces (standard LeRobot v3 schema, so `lerobot`/smolvla tooling
 reads it directly):
 
 - `observation.images.cam_main` — frame (PNG, letterboxed to 540×720 by default)
-- `observation.state` — 8-D absolute Sensapex state
+- `observation.state` — 8-D absolute Sensapex state (4-D for single-uMp datasets)
 - `action` — 8-D **absolute** Sensapex target (robot-native; see action space below)
 - `task` — the per-trial instruction
+
+> Single-uMp (4-DoF) datasets: set `CSV_STATE_COLS`/`CSV_ACTION_COLS` in
+> `config/config.py` to the uMp1 columns only, and convert with a new
+> `--robot-type` (e.g. `sensapex_single_ump4`). The CSV can keep all 8 columns —
+> the converter reads only the ones you list.
 
 ### Varied, grounded instructions
 

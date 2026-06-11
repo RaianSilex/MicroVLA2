@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from config import vla_config as C
-from data.vla_dataset import VocabBundle, build_vla_dataset
+from data.vla_dataset import VocabBundle
 from data.lerobot_vla_dataset import build_lerobot_vla_dataset
 from data.feature_cache import FeatureCache
 from model.finetune import (
@@ -29,19 +29,16 @@ from utils import AverageMeter, build_optimizer, format_meters, set_seed
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train MicroVLA on heterogeneous micromanipulation data.")
-    p.add_argument("--episodes-dir", type=Path, default=C.VLA_EPISODES_DIR,
-                   help="Legacy dataset_vla/episodes loader. Ignored if --dataset-repo-id is set.")
     p.add_argument("--dataset-repo-id", type=str, default=None,
-                   help="LeRobot dataset repo id (SmolVLA/OpenPI-style). When set, MicroVLA trains "
-                        "from this LeRobot dataset instead of --episodes-dir.")
+                   help="LeRobot dataset repo id to train from (required, unless resuming — which "
+                        "restores it from the checkpoint). Build one with "
+                        "dataset_vla/convert_microact_to_lerobot.py.")
     p.add_argument("--dataset-root", type=Path, default=None,
                    help="Local root for the LeRobot dataset. Default: HF_LEROBOT_HOME/<repo-id>.")
     p.add_argument("--action-space", choices=("delta", "absolute"), default=C.DEFAULT_ACTION_SPACE,
-                   help="Action representation for the LeRobot loader. 'delta' (relative to base "
-                        "state) is recommended; inference converts it back to absolute. The legacy "
-                        "episodes loader always uses absolute.")
+                   help="Action representation. 'delta' (relative to base state) is recommended; "
+                        "inference converts it back to absolute.")
     p.add_argument("--ckpt-dir", type=Path, default=C.VLA_CKPT_DIR)
-    p.add_argument("--stats-path", type=Path, default=None)
     p.add_argument("--epochs", type=int, default=C.NUM_EPOCHS)
     p.add_argument("--batch-size", type=int, default=C.BATCH_SIZE)
     p.add_argument("--lr", type=float, default=C.LR)
@@ -264,27 +261,19 @@ def main() -> None:
         if _rcfg0.get("dataset_repo_id") and args.dataset_repo_id is None:
             args.dataset_repo_id = _rcfg0["dataset_repo_id"]
 
-    use_lerobot = args.dataset_repo_id is not None
-    if use_lerobot:
-        full_ds = build_lerobot_vla_dataset(
-            repo_id=args.dataset_repo_id,
-            root=args.dataset_root,
-            action_space=args.action_space,
-            chunk_size=C.CHUNK_SIZE,
+    if args.dataset_repo_id is None:
+        raise SystemExit(
+            "--dataset-repo-id is required. MicroVLA trains from a LeRobot dataset; build one with "
+            "dataset_vla/convert_microact_to_lerobot.py (v3) or convert_microact_to_lerobot_v21.py."
         )
-        print(f"loaded LeRobot dataset {args.dataset_repo_id} "
-              f"(robot_id={full_ds.episodes[0].robot_id!r}, action_space={args.action_space})")
-    else:
-        if args.action_space != "absolute":
-            print("[warn] legacy --episodes-dir loader trains on absolute actions; "
-                  "forcing --action-space absolute.")
-            args.action_space = "absolute"
-        stats_path = args.stats_path or (args.ckpt_dir / "vla_stats.pkl")
-        full_ds = build_vla_dataset(
-            episodes_dir=args.episodes_dir,
-            stats_path=stats_path,
-            recompute_stats=True,
-        )
+    full_ds = build_lerobot_vla_dataset(
+        repo_id=args.dataset_repo_id,
+        root=args.dataset_root,
+        action_space=args.action_space,
+        chunk_size=C.CHUNK_SIZE,
+    )
+    print(f"loaded LeRobot dataset {args.dataset_repo_id} "
+          f"(robot_id={full_ds.episodes[0].robot_id!r}, action_space={args.action_space})")
     train_ds, val_ds, train_eps, val_eps = _episode_split(full_ds, args)
     val_names = [full_ds.episodes[i].episode_id for i in sorted(val_eps)]
     print(f"dataset: train={len(train_ds)} val={len(val_ds)} total={len(full_ds)}")
@@ -395,9 +384,6 @@ def main() -> None:
         if args.unfreeze_backbone:
             print("[feature-cache] --unfreeze-backbone is set; encoder outputs "
                   "change during training, so the cache would be stale. Disabling.")
-        elif not use_lerobot:
-            print("[feature-cache] only supported for the LeRobot loader "
-                  "(--dataset-repo-id); disabling.")
         else:
             cache_dir = args.feature_cache_dir or (
                 args.ckpt_dir
