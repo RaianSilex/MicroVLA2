@@ -134,6 +134,11 @@ class _SensapexROSNode(Node):
         ump2_msg.data = [int(x2), int(y2), int(z2), int(d2), int(speed)]
         self.pub_ump2_target.publish(ump2_msg)
 
+    def send_action_ump1(self, x1, y1, z1, d1, speed=100) -> None:
+        ump1_msg = Int32MultiArray()
+        ump1_msg.data = [int(x1), int(y1), int(z1), int(d1), int(speed)]
+        self.pub_ump1_target.publish(ump1_msg)
+
 
 class SensapexEnv:
     """Synchronous wrapper around `_SensapexROSNode`."""
@@ -146,8 +151,10 @@ class SensapexEnv:
         preview_every_n_frames: int = 5,
         default_speed: int = 100,
         wait_timeout_s: float = 10.0,
+        n_ump: int = 2,
     ):
         self.default_speed = int(default_speed)
+        self.n_ump = int(n_ump)
 
         rclpy.init(args=None)
         self.node = _SensapexROSNode(
@@ -166,7 +173,8 @@ class SensapexEnv:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
             img, ump1, ump2 = self.node.get_latest()
-            if img is not None and ump1 is not None and ump2 is not None:
+            ok2 = (ump2 is not None) or (self.n_ump < 2)
+            if img is not None and ump1 is not None and ok2:
                 return
             time.sleep(0.05)
         raise RuntimeError(
@@ -175,24 +183,34 @@ class SensapexEnv:
 
     def get_observation(self) -> SensapexObs:
         img, ump1, ump2 = self.node.get_latest()
-        if img is None or ump1 is None or ump2 is None:
-            raise RuntimeError("Missing observation components (image/ump1/ump2).")
+        if img is None or ump1 is None:
+            raise RuntimeError("Missing observation components (image/ump1).")
 
         x1, y1, z1, d1 = ump1
-        x2, y2, z2, d2 = ump2
-        state = np.array([x1, y1, z1, d1, x2, y2, z2, d2], dtype=np.float32)
+        if self.n_ump == 1:
+            state = np.array([x1, y1, z1, d1], dtype=np.float32)
+        else:
+            if ump2 is None:
+                raise RuntimeError("Missing ump2 observation.")
+            x2, y2, z2, d2 = ump2
+            state = np.array([x1, y1, z1, d1, x2, y2, z2, d2], dtype=np.float32)
         return SensapexObs(image_rgb=img, state=state)
 
-    def step_absolute(self, action_8d: np.ndarray) -> None:
-        """Send an absolute target [x1,y1,z1,d1,x2,y2,z2,d2]."""
-        action_8d = np.asarray(action_8d).reshape(-1)
-        if action_8d.shape != (8,):
-            raise ValueError(f"Expected action shape (8,), got {action_8d.shape}")
-
-        x1, y1, z1, d1, x2, y2, z2, d2 = action_8d
-        self.node.send_action_absolute(
-            x1, y1, z1, d1, x2, y2, z2, d2, speed=self.default_speed
-        )
+    def step_absolute(self, action: np.ndarray) -> None:
+        """Send an absolute target (4-D = uMp1 only, or 8-D = dual)."""
+        action = np.asarray(action).reshape(-1)
+        if self.n_ump == 1:
+            if action.shape != (4,):
+                raise ValueError(f"Expected action shape (4,), got {action.shape}")
+            x1, y1, z1, d1 = action
+            self.node.send_action_ump1(x1, y1, z1, d1, speed=self.default_speed)
+        else:
+            if action.shape != (8,):
+                raise ValueError(f"Expected action shape (8,), got {action.shape}")
+            x1, y1, z1, d1, x2, y2, z2, d2 = action
+            self.node.send_action_absolute(
+                x1, y1, z1, d1, x2, y2, z2, d2, speed=self.default_speed
+            )
 
     def close(self) -> None:
         try:

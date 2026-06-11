@@ -26,7 +26,7 @@ from rollout.rollout import start_estop_listener
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Run a MicroVLA checkpoint through a robot adapter.")
     p.add_argument("--checkpoint", type=Path, default=Path("checkpoints_vla/vla_policy_best.pt"))
-    p.add_argument("--adapter", choices=("sensapex_dual",), default="sensapex_dual")
+    p.add_argument("--adapter", choices=("sensapex_dual", "sensapex_single"), default="sensapex_dual")
     p.add_argument("--instruction", type=str, default="perform the cell manipulation task")
     p.add_argument("--backbone", type=str, default=None, help="Defaults to checkpoint config.")
     p.add_argument("--language-backend", choices=("hf", "simple"), default=None,
@@ -69,6 +69,15 @@ def _get_adapter(args):
         from rollout.adapters.sensapex_dual import SensapexDualAdapter
 
         return SensapexDualAdapter(
+            default_speed=args.default_speed,
+            save_preview=args.save_preview,
+            preview_path=args.preview_path,
+            preview_every_n_frames=args.preview_every_n_frames,
+        )
+    if args.adapter == "sensapex_single":
+        from rollout.adapters.sensapex_single import SensapexSingleAdapter
+
+        return SensapexSingleAdapter(
             default_speed=args.default_speed,
             save_preview=args.save_preview,
             preview_path=args.preview_path,

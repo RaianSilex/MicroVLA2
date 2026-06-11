@@ -133,15 +133,29 @@ def clamp_action_8d(action_8d: np.ndarray) -> np.ndarray:
     )
 
 
-def limit_step(prev_state_8d: np.ndarray, target_action_8d: np.ndarray) -> np.ndarray:
-    """Cap each axis' per-tick movement so far targets ramp in safely."""
-    prev = np.asarray(prev_state_8d, dtype=np.float32).reshape(8,)
-    tgt = np.asarray(target_action_8d, dtype=np.float32).reshape(8,)
-    caps = (MAX_DX1, MAX_DY1, MAX_DZ1, MAX_DD1, MAX_DX2, MAX_DY2, MAX_DZ2, MAX_DD2)
+def clamp_action_4d(action_4d: np.ndarray) -> np.ndarray:
+    """Clamp absolute uMp1 action [x1,y1,z1,d1] to the safe box."""
+    a = np.asarray(action_4d, dtype=np.float32).reshape(4,)
+    return np.array(
+        [
+            clamp(a[0], X1_MIN, X1_MAX),
+            clamp(a[1], Y1_MIN, Y1_MAX),
+            clamp(a[2], Z1_MIN, Z1_MAX),
+            clamp(a[3], D1_MIN, D1_MAX),
+        ],
+        dtype=np.float32,
+    )
 
-    out = np.empty(8, dtype=np.float32)
-    for i, cap in enumerate(caps):
-        out[i] = prev[i] + clamp(tgt[i] - prev[i], -cap, cap)
+
+def limit_step(prev_state: np.ndarray, target_action: np.ndarray) -> np.ndarray:
+    """Cap each axis' per-tick movement. Works for 4-D (uMp1) or 8-D (dual)."""
+    prev = np.asarray(prev_state, dtype=np.float32).reshape(-1)
+    tgt = np.asarray(target_action, dtype=np.float32).reshape(-1)
+    caps = (MAX_DX1, MAX_DY1, MAX_DZ1, MAX_DD1, MAX_DX2, MAX_DY2, MAX_DZ2, MAX_DD2)
+    n = prev.shape[0]
+    out = np.empty(n, dtype=np.float32)
+    for i in range(n):
+        out[i] = prev[i] + clamp(tgt[i] - prev[i], -caps[i], caps[i])
     return out
 
 
