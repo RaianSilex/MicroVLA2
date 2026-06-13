@@ -1,147 +1,169 @@
-"""Offline replay diagnostic for a MicroACT checkpoint.
+"""Offline diagnostic for a MicroVLA checkpoint (no hardware / ROS).
 
-Question answered: does this policy actually condition its output on the
-recorded image + qpos, or has it collapsed to predicting the dataset-mean
-action regardless of input?
+Question answered: does this policy condition its output on the image + state +
+language, or has it collapsed to predicting the dataset-mean action regardless of
+input?
 
-No hardware/ROS needed. Feeds recorded TRAINING frames + qpos through
-`policy.inference` (teacher-forced, using the exact training image loader) and
-compares predictions to the logged ground-truth targets against a constant
-"predict dataset mean" baseline.
+It runs recorded frames through the policy (``actions=None``, the deployment path)
+and compares the predicted action chunk to the logged ground truth against a
+"predict the dataset mean" baseline. Everything is in normalized space, where the
+mean baseline is simply zero, so:
+
+    ratio = mean|a_hat - a_gt| / mean|a_gt|
+
+``ratio ~ 1.0`` => no better than predicting the mean (not conditioning on inputs);
+``ratio << 1.0`` => the policy is using its inputs.
+
+If the contact-point goal head is enabled, it also reports the correlation between
+the predicted goal mean and the true contact point per active axis.
 
 Run from the repo root:
     python -m rollout.offline_replay \
-        --checkpoint checkpoints/microact_resnet_66epi_200epoch/policy_best.pt \
-        --stats-path checkpoints/microact_resnet_66epi_200epoch/dataset_stats.pkl \
-        --backbone resnet18
+        --checkpoint checkpoints_vla/vla_policy_best.pt \
+        --dataset-repo-id RaianSilex/microvla_ump_dataset
 """
 
 from __future__ import annotations
 
 import argparse
-import pickle
 import sys
 from pathlib import Path
 
 import numpy as np
 import torch
+from torch.utils.data import default_collate
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from config import config as C
-from data.dataset import (
-    _load_image,
-    _resolve_image_path,
-    discover_trials,
-    load_trial,
-)
-from model.act_policy import build_policy
-from utils import load_checkpoint
-
-AXES = ["x1", "y1", "z1", "d1", "x2", "y2", "z2", "d2"]
-ACTIVE = [0, 1, 4, 5]  # x1, y1, x2, y2 — the axes that actually move in the demos
+from config import vla_config as C
+from model.vla_policy import build_vla_policy
 
 
-def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--checkpoint", type=Path, required=True)
-    p.add_argument("--stats-path", type=Path, required=True)
-    p.add_argument("--backbone", type=str, default="resnet18")
-    p.add_argument("--device", type=str,
-                   default="cuda" if torch.cuda.is_available() else "cpu")
-    p.add_argument("--num-trials", type=int, default=8)
-    p.add_argument("--samples-per-trial", type=int, default=12)
-    p.add_argument("--seed", type=int, default=0)
-    return p.parse_args()
+def _move(batch: dict, device) -> dict:
+    out = {}
+    for k, v in batch.items():
+        out[k] = v.to(device) if torch.is_tensor(v) else v
+    return out
 
 
-def load_policy(args) -> tuple:
-    with open(args.stats_path, "rb") as f:
-        stats = pickle.load(f)
-    policy = build_policy(
-        stats=stats,
-        pretrained_backbone=False,
-        backbone_name=args.backbone,
-        freeze_backbone=True,
-    ).to(args.device)
-    load_checkpoint(args.checkpoint, policy, map_location=args.device)
+@torch.no_grad()
+def evaluate(policy, dataset, device, num_samples: int = 64, seed: int = 0) -> dict:
+    """Run the policy over sampled frames and measure conditioning vs mean-collapse.
+
+    ``dataset`` yields the MicroVLA per-sample dict (LeRobotVLADataset or a mock).
+    Returns a dict of metrics and prints a readable report.
+    """
     policy.eval()
-    return policy, stats
+    n = len(dataset)
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(n, size=min(num_samples, n), replace=False)
+    batch = _move(default_collate([dataset[int(i)] for i in idx]), device)
+
+    image = batch.get("image")
+    a_hat, goal_params, _ = policy.model(
+        image,
+        batch["qpos"],
+        batch["instruction"],
+        batch["robot_id"],
+        batch["lab_id"],
+        batch["embodiment_id"],
+        batch["action_type_id"],
+        batch["task_family_id"],
+        state_mask=batch.get("state_mask"),
+        action_mask=batch.get("action_mask"),
+        resistance=batch.get("resistance"),
+        img_primary_feat=batch.get("primary_feat"),
+        img_aux_feat=batch.get("aux_feat"),
+    )
+
+    gt = batch["action"]                                  # (B, k, A) normalized
+    valid = (~batch["is_pad"]).unsqueeze(-1).float() * batch["action_mask"].unsqueeze(1).float()
+    denom = valid.sum(dim=(0, 1)).clamp_min(1.0)          # (A,)
+    err_policy = ((a_hat - gt).abs() * valid).sum(dim=(0, 1)) / denom
+    err_mean = (gt.abs() * valid).sum(dim=(0, 1)) / denom  # baseline = predict 0 (the mean)
+    ratio = err_policy / err_mean.clamp_min(1e-6)
+
+    active = (batch["action_mask"][0] & (err_mean > 1e-4)).cpu().numpy()
+    err_policy_np = err_policy.cpu().numpy()
+    err_mean_np = err_mean.cpu().numpy()
+    ratio_np = ratio.cpu().numpy()
+
+    print(f"\nSamples: {len(idx)} | device={device}")
+    print("=== normalized one-chunk action error: policy vs predict-mean baseline ===")
+    print(f"{'axis':>4} {'policy':>9} {'meanbase':>9} {'ratio':>6}")
+    for a in range(gt.shape[-1]):
+        if not active[a]:
+            continue
+        print(f"{a:>4} {err_policy_np[a]:9.3f} {err_mean_np[a]:9.3f} {ratio_np[a]:6.2f}")
+    active_ratio = float(ratio_np[active].mean()) if active.any() else float("nan")
+    print(f"{'ALL':>4} {'':9} {'':9} {active_ratio:6.2f}   (mean over active axes)")
+    print("ratio ~1.0 => mean-collapse (inputs ignored); ratio << 1.0 => conditioning on inputs")
+
+    metrics = {"ratio_per_axis": ratio_np, "active_axes": active, "active_ratio": active_ratio}
+
+    if goal_params is not None and "goal" in batch:
+        goal_mu = goal_params[0].cpu().numpy()           # (B, A)
+        goal_gt = batch["goal"].cpu().numpy()            # (B, A)
+        print("\n=== contact-point goal: corr(true, predicted) per active axis ===")
+        corrs = {}
+        for a in range(goal_gt.shape[-1]):
+            if not active[a]:
+                continue
+            if goal_gt[:, a].std() > 1e-6 and goal_mu[:, a].std() > 1e-6:
+                r = float(np.corrcoef(goal_gt[:, a], goal_mu[:, a])[0, 1])
+            else:
+                r = float("nan")
+            corrs[a] = r
+            print(f"  axis {a}: r={r:+.2f}  (pred std={goal_mu[:, a].std():.3f}, "
+                  f"true std={goal_gt[:, a].std():.3f})")
+        metrics["goal_corr"] = corrs
+
+    return metrics
+
+
+def load_policy(checkpoint: Path, device: str):
+    ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
+    cfg = ckpt.get("config", {})
+    policy = build_vla_policy(
+        stats=ckpt["stats"],
+        vocabs=ckpt["vocabs"],
+        pretrained_backbone=False,
+        backbone_name=cfg.get("backbone", C.DEFAULT_BACKBONE),
+        freeze_backbone=bool(cfg.get("freeze_backbone", True)),
+        language_backend=cfg.get("language_backend", C.LANGUAGE_BACKEND),
+        text_model_name=cfg.get("text_model", C.DEFAULT_TEXT_MODEL),
+        action_space=cfg.get("action_space", C.DEFAULT_ACTION_SPACE),
+        chunk_size=int(cfg.get("chunk_size", C.CHUNK_SIZE)),
+        goal_head=bool(cfg.get("goal_head", C.GOAL_HEAD)),
+        use_resistance=bool(cfg.get("use_resistance", False)),
+    ).to(device)
+    policy.load_state_dict(ckpt["policy"])
+    policy.eval()
+    return policy, cfg
 
 
 def main() -> None:
-    args = parse_args()
-    policy, stats = load_policy(args)
-    action_mean = np.asarray(stats["action_mean"], dtype=np.float32)
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--checkpoint", type=Path, required=True)
+    p.add_argument("--dataset-repo-id", type=str, default=C.DEFAULT_DATASET_REPO_ID)
+    p.add_argument("--dataset-root", type=Path, default=None)
+    p.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--num-samples", type=int, default=64)
+    p.add_argument("--seed", type=int, default=0)
+    args = p.parse_args()
 
-    trials = [load_trial(p) for p in discover_trials()]
-    trials = [t for t in trials if t.length >= 5]
-    # Pick trials spread across their TRUE endpoint x1 so we cover diverse targets.
-    trials.sort(key=lambda t: float(t.actions[-1, 0]))
-    pick = np.linspace(0, len(trials) - 1, min(args.num_trials, len(trials))).astype(int)
-    chosen = [trials[i] for i in pick]
+    from data.lerobot_vla_dataset import build_lerobot_vla_dataset
 
-    H, W = C.IMAGE_HEIGHT, C.IMAGE_WIDTH
-    rng = np.random.default_rng(args.seed)
-
-    preds, gts = [], []
-    endpoints = []  # (trial_id, true_end_8d, pred_end_8d)
-
-    for tr in chosen:
-        ts = rng.choice(tr.length, size=min(args.samples_per_trial, tr.length), replace=False)
-        for t in sorted(ts):
-            img = _load_image(_resolve_image_path(tr.image_paths[t], tr.trial_id, t), H, W)
-            chunk = policy.inference(img, tr.states[t].astype(np.float32))  # (k, 8)
-            preds.append(chunk[0])
-            gts.append(tr.actions[t])
-
-        # Where does the policy think this trial ends? Use an early frame and
-        # read the last action of the predicted chunk.
-        t0 = max(0, tr.length // 5)
-        img = _load_image(_resolve_image_path(tr.image_paths[t0], tr.trial_id, t0), H, W)
-        chunk = policy.inference(img, tr.states[t0].astype(np.float32))
-        endpoints.append((tr.trial_id, tr.actions[-1], chunk[-1]))
-
-    preds = np.asarray(preds)
-    gts = np.asarray(gts)
-    err_policy = np.abs(preds - gts).mean(0)
-    err_mean = np.abs(action_mean[None, :] - gts).mean(0)
-
-    print(f"\nSamples: {len(preds)} from {len(chosen)} trials | device={args.device}")
-    print("\n=== One-step action error (counts): policy vs 'predict dataset mean' ===")
-    print(f"{'axis':>4} {'policy':>9} {'meanbase':>9} {'ratio':>6}")
-    for i, a in enumerate(AXES):
-        print(f"{a:>4} {err_policy[i]:9.1f} {err_mean[i]:9.1f} "
-              f"{err_policy[i] / max(err_mean[i], 1e-6):6.2f}")
-    print(f"{'ALL':>4} {err_policy.mean():9.1f} {err_mean.mean():9.1f} "
-          f"{err_policy.mean() / max(err_mean.mean(), 1e-6):6.2f}")
-    print("ratio ~1.0 => no better than predicting the mean (not conditioning);"
-          " ratio << 1.0 => using the inputs")
-
-    print("\n=== Predicted endpoint vs true endpoint (active axes) ===")
-    print(f"{'trial':>6} {'x1_true':>8}{'x1_pred':>8} {'y1_true':>8}{'y1_pred':>8} "
-          f"{'x2_true':>8}{'x2_pred':>8} {'y2_true':>8}{'y2_pred':>8}")
-    te, pe = [], []
-    for tid, tru, prd in endpoints:
-        te.append(tru)
-        pe.append(prd)
-        print(f"{tid:>6} {tru[0]:8.0f}{prd[0]:8.0f} {tru[1]:8.0f}{prd[1]:8.0f} "
-              f"{tru[4]:8.0f}{prd[4]:8.0f} {tru[5]:8.0f}{prd[5]:8.0f}")
-    te = np.asarray(te)
-    pe = np.asarray(pe)
-
-    print("\ncorr(true_endpoint, pred_endpoint) on active axes:")
-    for i in ACTIVE:
-        if te[:, i].std() > 1e-6 and pe[:, i].std() > 1e-6:
-            r = float(np.corrcoef(te[:, i], pe[:, i])[0, 1])
-        else:
-            r = float("nan")
-        print(f"  {AXES[i]}: r={r:+.2f}  (pred std={pe[:, i].std():6.0f}, "
-              f"true std={te[:, i].std():6.0f})")
-    print("\nLow pred std + r~0 => policy emits ~the same endpoint regardless of trial"
-          " => image ignored / mean collapse.")
+    policy, cfg = load_policy(args.checkpoint, args.device)
+    dataset = build_lerobot_vla_dataset(
+        repo_id=args.dataset_repo_id,
+        root=args.dataset_root,
+        action_space=cfg.get("action_space", C.DEFAULT_ACTION_SPACE),
+        chunk_size=int(cfg.get("chunk_size", C.CHUNK_SIZE)),
+    )
+    evaluate(policy, dataset, args.device, num_samples=args.num_samples, seed=args.seed)
 
 
 if __name__ == "__main__":

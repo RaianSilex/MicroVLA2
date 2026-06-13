@@ -1,26 +1,51 @@
-"""Configuration for the heterogeneous MicroVLA pipeline.
+"""Configuration for MicroVLA.
 
-The original MicroACT path stays fixed to the current dual-Sensapex rig. This
-module defines the wider contract used when demonstrations come from multiple
-robots, labs, action conventions, and language-labeled tasks.
+Single source of truth for shapes, model hyperparameters, dataset/feature keys,
+and the optional learnable-feature switches (contact-point goal head, per-axis
+action weighting, optional resistance conditioning).
+
+MicroVLA trains from a LeRobot-format dataset (SmolVLA / OpenPI / pi0 style).
+The raw-CSV constants near the top are only used by the dataset converters under
+``dataset_vla/`` to read the original micromanipulation logs.
 """
 
 import os
 from pathlib import Path
 
-from config import config as ACT
-
 # ---------- Paths ----------
-REPO_ROOT = ACT.REPO_ROOT
-_VLA_DATASET_ROOT_ENV = os.environ.get("MICROVLA_VLA_DATASET_ROOT")
-VLA_DATASET_ROOT = (
-    Path(_VLA_DATASET_ROOT_ENV).expanduser()
-    if _VLA_DATASET_ROOT_ENV
-    else REPO_ROOT / "dataset_vla"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Raw micromanipulation logs (only read by the dataset_vla converters).
+_DATASET_ROOT_ENV = os.environ.get("MICROVLA_DATASET_ROOT")
+DATASET_ROOT = (
+    Path(_DATASET_ROOT_ENV).expanduser() if _DATASET_ROOT_ENV else REPO_ROOT / "dataset"
 )
-VLA_EPISODES_DIR = VLA_DATASET_ROOT / "episodes"
+
 VLA_CKPT_DIR = REPO_ROOT / "checkpoints_vla"
 VLA_STATS_PATH = VLA_CKPT_DIR / "vla_stats.pkl"
+
+# ---------- Raw CSV layout (converters only) ----------
+# State  = [x1, y1, z1, d1, x2, y2, z2, d2]   (centered Sensapex counts)
+# Action = absolute target in the same 8-dim space.
+CSV_STATE_COLS = (
+    "current_x",  "current_y",  "current_z",  "current_d",
+    "current_x2", "current_y2", "current_z2", "current_d2",
+)
+CSV_ACTION_COLS = (
+    "target_x",  "target_y",  "target_z",  "target_d",
+    "target_x2", "target_y2", "target_z2", "target_d2",
+)
+CSV_IMAGE_COL = "image_path"
+CSV_TIMESTEP_COL = "timestep"
+# Optional per-timestep pipette resistance (megaohms). Used automatically if the
+# column exists and has real values; ignored otherwise. See "Resistance" below.
+CSV_RESISTANCE_COL = "resistance_mohm"
+
+# ---------- Vision ----------
+NUM_CAMERAS = 1
+CAMERA_NAMES = ("cam_main",)
+IMAGE_HEIGHT = 240
+IMAGE_WIDTH = 320
 
 # ---------- Heterogeneous robot contract ----------
 # Each episode can expose fewer dimensions. Samples are padded to these maxima
@@ -31,33 +56,53 @@ MAX_ACTION_DIM = 16
 STATE_MASK_KEY = "state_mask"
 ACTION_MASK_KEY = "action_mask"
 
-# ---------- Vision / language / action chunking ----------
-NUM_CAMERAS = ACT.NUM_CAMERAS
-IMAGE_HEIGHT = ACT.IMAGE_HEIGHT
-IMAGE_WIDTH = ACT.IMAGE_WIDTH
-CHUNK_SIZE = ACT.CHUNK_SIZE
+# ---------- Action chunking ----------
+# At ~3 Hz, 30 steps is ~10 s of future actions — well matched to the short
+# micromanipulation moves in this data. (The old ACT default of 100 covered up to
+# half a trial, which forced the model to regress noisy far-future targets.)
+CHUNK_SIZE = 30
 
+# ---------- Model hyperparameters ----------
+HIDDEN_DIM = 512
+DIM_FEEDFORWARD = 3200
+ENC_LAYERS = 4
+DEC_LAYERS = 7
+NHEAD = 8
+DROPOUT = 0.1
+LATENT_DIM = 32           # CVAE style-latent dimension
+KL_WEIGHT = 10.0          # beta on the KL term (ACT paper default)
+
+# ---------- Backbone ----------
 DEFAULT_BACKBONE = "dinov2_vits14+cellpose4"
+# Shared backbone module reads BACKBONE / BACKBONE_PRETRAINED as fallbacks.
+BACKBONE = DEFAULT_BACKBONE
+BACKBONE_PRETRAINED = True
+
+# Cellpose 4 / Cellpose-SAM defaults (used by the `cellpose4` backbone).
+CELLPOSE4_DIAMETER = 180.0
+CELLPOSE4_CELLPROB_THRESHOLD = -2.0
+CELLPOSE4_FLOW_THRESHOLD = 1.5
+CELLPOSE4_INCLUDE_READOUT = True
+
+# ---------- Language ----------
 DEFAULT_TEXT_MODEL = "distilbert-base-uncased"
 LANGUAGE_BACKEND = "hf"          # "hf" for frozen Transformers, "simple" for offline smoke tests
 SIMPLE_TEXT_VOCAB_SIZE = 8192
 MAX_LANGUAGE_TOKENS = 32
 
 # ---------- LeRobot dataset (HF) ----------
-# MicroVLA can train from a LeRobot-format dataset (like SmolVLA / OpenPI / pi0)
-# instead of the local dataset_vla/episodes/ tree. The dataset is robot-native:
-# it stores ABSOLUTE Sensapex targets; the action space (delta vs absolute) is a
-# train-time transform chosen here / on the CLI. See data/lerobot_vla_dataset.py
-# and dataset_vla/convert_microact_to_lerobot.py.
 DEFAULT_DATASET_REPO_ID = "RaianSilex/microvla_ump_dataset"
 DEFAULT_ACTION_SPACE = "delta"   # "delta" (relative to base state) or "absolute"
 # Standard LeRobot feature keys (so smolvla/lerobot tooling can read the dataset).
 LEROBOT_CAMERA_KEY = "observation.images.cam_main"
 LEROBOT_STATE_KEY = "observation.state"
 LEROBOT_ACTION_KEY = "action"
+# Optional: per-frame pipette resistance, written by the converter only when the
+# raw logs contain real resistance values. The loader auto-detects it.
+LEROBOT_RESISTANCE_KEY = "observation.resistance"
 
-# Vocabulary fallback ids. Real ids are built from dataset metadata in
-# data/vla_dataset.py and saved into VLA checkpoints.
+# ---------- Metadata vocab fallbacks ----------
+# Real ids are built from dataset metadata and saved into VLA checkpoints.
 UNKNOWN_TOKEN = "<unk>"
 DEFAULT_ROBOT_ID = "sensapex_dual_ump4"
 DEFAULT_LAB_ID = "local_lab"
@@ -65,37 +110,50 @@ DEFAULT_EMBODIMENT = "dual_manipulator"
 DEFAULT_ACTION_TYPE = "absolute_position"
 DEFAULT_TASK_FAMILY = "cell_manipulation"
 
-# ---------- Model hyperparameters ----------
-HIDDEN_DIM = ACT.HIDDEN_DIM
-DIM_FEEDFORWARD = ACT.DIM_FEEDFORWARD
-ENC_LAYERS = ACT.ENC_LAYERS
-DEC_LAYERS = ACT.DEC_LAYERS
-NHEAD = ACT.NHEAD
-DROPOUT = ACT.DROPOUT
-LATENT_DIM = ACT.LATENT_DIM
-KL_WEIGHT = ACT.KL_WEIGHT
-
 NUM_ROBOT_IDS_FALLBACK = 64
 NUM_LAB_IDS_FALLBACK = 64
 NUM_EMBODIMENT_IDS_FALLBACK = 32
 NUM_ACTION_TYPE_IDS_FALLBACK = 32
 NUM_TASK_FAMILY_IDS_FALLBACK = 64
 
-# ---------- Training ----------
-BATCH_SIZE = ACT.BATCH_SIZE
-NUM_EPOCHS = ACT.NUM_EPOCHS
-LR = ACT.LR
-LR_BACKBONE = ACT.LR_BACKBONE
-WEIGHT_DECAY = ACT.WEIGHT_DECAY
-SEED = ACT.SEED
-DEVICE = ACT.DEVICE
+# ---------- Contact-point (goal) head ----------
+# An auxiliary head predicts a Gaussian over the episode's final reached target
+# (the "contact point") in the action representation: mean + per-dim log-variance.
+# It is trained with a Gaussian negative-log-likelihood (so the variance is a
+# learned, calibrated uncertainty) and the prediction conditions the trajectory
+# decoder. See model/vla_cvae.py and model/vla_policy.py.
+GOAL_HEAD = True
+GOAL_LOSS_WEIGHT = 1.0
+GOAL_LOGVAR_MIN = -6.0     # clamp predicted log-variance for numerical stability
+GOAL_LOGVAR_MAX = 4.0
 
-# Heterogeneous data should be split by whole episodes by default. Lab/robot
-# holdouts can be added on top from the metadata without changing the model.
-VAL_SPLIT = 0.1
+# ---------- Per-axis adaptive action weighting ----------
+# The masked L1 over the action chunk is weighted per dimension by how much that
+# axis actually moves in the dataset, so near-constant axes (e.g. a fixed depth)
+# stop diluting the loss while axes that DO move (or start moving in a future
+# dataset) are learned. Computed from data; nothing is hard-coded per rig.
+AXIS_WEIGHTING = True
+AXIS_WEIGHT_MIN = 0.05     # floor so a dim is never fully ignored
+AXIS_WEIGHT_MAX = 3.0      # cap so no single dim dominates
+
+# ---------- Resistance conditioning (optional) ----------
+# If the dataset carries a per-frame resistance signal, the policy conditions on
+# it via an extra source token. Training randomly zeroes it (modality dropout) so
+# the same checkpoint still runs when the sensor is absent at rollout.
+RESISTANCE_DROPOUT = 0.3
+
+# ---------- Training ----------
+BATCH_SIZE = 8
+NUM_EPOCHS = 2000
+LR = 1e-5
+LR_BACKBONE = 1e-5
+WEIGHT_DECAY = 1e-4
+SEED = 0
+DEVICE = "cuda"
+VAL_SPLIT = 0.1            # episode-level validation fraction
 
 # ---------- Rollout ----------
-OPEN_LOOP_HORIZON = ACT.OPEN_LOOP_HORIZON
-CONTROL_HZ = ACT.CONTROL_HZ
-TEMPORAL_AGG = ACT.TEMPORAL_AGG
-TEMPORAL_AGG_K = ACT.TEMPORAL_AGG_K
+OPEN_LOOP_HORIZON = 8       # actions consumed per inference during rollout
+CONTROL_HZ = 5.0
+TEMPORAL_AGG = True         # ACT-style exponential ensembling in rollout/vla_main.py
+TEMPORAL_AGG_K = 0.01

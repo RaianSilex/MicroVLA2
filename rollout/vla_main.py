@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-ema-smoothing", dest="use_ema_smoothing", action="store_false")
     p.add_argument("--ema-alpha", type=float, default=0.35)
     p.add_argument("--no-save-preview", dest="save_preview", action="store_false")
-    p.add_argument("--preview-path", type=str, default="microact_vla_live.png")
+    p.add_argument("--preview-path", type=str, default="microvla_live.png")
     p.add_argument("--preview-every-n-frames", type=int, default=5)
     p.add_argument("--debug-every", type=int, default=10)
     p.add_argument("--lab-id", type=str, default=None)
@@ -136,6 +136,9 @@ def load_policy(args):
         language_backend=language_backend,
         text_model_name=text_model,
         action_space=action_space,
+        chunk_size=int(ckpt_config.get("chunk_size", C.CHUNK_SIZE)),
+        goal_head=bool(ckpt_config.get("goal_head", C.GOAL_HEAD)),
+        use_resistance=bool(ckpt_config.get("use_resistance", False)),
     ).to(device)
     policy.load_state_dict(ckpt["policy"])
     policy.eval()

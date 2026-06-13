@@ -52,7 +52,7 @@ import torch.nn.functional as F
 import torchvision
 from torchvision.models._utils import IntermediateLayerGetter
 
-from config import config as C
+from config import vla_config as C
 
 
 _DINOV2_EMBED_DIMS = {

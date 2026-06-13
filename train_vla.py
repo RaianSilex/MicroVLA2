@@ -1,4 +1,4 @@
-"""Train MicroVLA on metadata-driven heterogeneous demonstrations."""
+"""Train MicroVLA on a LeRobot-format micromanipulation dataset."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from config import vla_config as C
-from data.vla_dataset import VocabBundle, build_vla_dataset
+from data.vocab import VocabBundle
 from data.lerobot_vla_dataset import build_lerobot_vla_dataset
 from data.feature_cache import FeatureCache
 from model.finetune import (
@@ -28,20 +28,15 @@ from utils import AverageMeter, build_optimizer, format_meters, set_seed
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train MicroVLA on heterogeneous micromanipulation data.")
-    p.add_argument("--episodes-dir", type=Path, default=C.VLA_EPISODES_DIR,
-                   help="Legacy dataset_vla/episodes loader. Ignored if --dataset-repo-id is set.")
-    p.add_argument("--dataset-repo-id", type=str, default=None,
-                   help="LeRobot dataset repo id (SmolVLA/OpenPI-style). When set, MicroVLA trains "
-                        "from this LeRobot dataset instead of --episodes-dir.")
+    p = argparse.ArgumentParser(description="Train MicroVLA on a LeRobot micromanipulation dataset.")
+    p.add_argument("--dataset-repo-id", type=str, default=C.DEFAULT_DATASET_REPO_ID,
+                   help="LeRobot dataset repo id (SmolVLA/OpenPI-style).")
     p.add_argument("--dataset-root", type=Path, default=None,
                    help="Local root for the LeRobot dataset. Default: HF_LEROBOT_HOME/<repo-id>.")
     p.add_argument("--action-space", choices=("delta", "absolute"), default=C.DEFAULT_ACTION_SPACE,
-                   help="Action representation for the LeRobot loader. 'delta' (relative to base "
-                        "state) is recommended; inference converts it back to absolute. The legacy "
-                        "episodes loader always uses absolute.")
+                   help="'delta' (relative to base state) is recommended; inference converts it "
+                        "back to absolute. 'absolute' trains on raw targets.")
     p.add_argument("--ckpt-dir", type=Path, default=C.VLA_CKPT_DIR)
-    p.add_argument("--stats-path", type=Path, default=None)
     p.add_argument("--epochs", type=int, default=C.NUM_EPOCHS)
     p.add_argument("--batch-size", type=int, default=C.BATCH_SIZE)
     p.add_argument("--lr", type=float, default=C.LR)
@@ -55,62 +50,48 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--save-every", type=int, default=100)
     p.add_argument("--resume", type=Path, default=None)
+    p.add_argument("--chunk-size", type=int, default=C.CHUNK_SIZE,
+                   help="Action chunk length. Read from the checkpoint on resume/finetune.")
+    p.add_argument("--goal-weight", type=float, default=C.GOAL_LOSS_WEIGHT,
+                   help="Weight on the contact-point Gaussian NLL. 0 disables that term.")
+    p.add_argument("--no-goal-head", dest="goal_head", action="store_false",
+                   help="Disable the contact-point Gaussian head entirely.")
+    p.set_defaults(goal_head=C.GOAL_HEAD)
     p.add_argument(
         "--cache-features", action="store_true",
-        help="Precompute and memmap the frozen image-encoder features once, then "
-             "train on the cache. Removes the per-step video decode and the frozen "
-             "ViT forward passes. Only valid with a frozen backbone (ignored if "
-             "--unfreeze-backbone is set).",
+        help="Precompute and memmap the frozen image-encoder features once, then train on the "
+             "cache. Removes the per-step video decode and the frozen ViT forward passes. Only "
+             "valid with a frozen backbone (ignored if --unfreeze-backbone is set).",
     )
-    p.add_argument(
-        "--feature-cache-dir", type=Path, default=None,
-        help="Where to store/read the feature cache. Default: "
-             "<ckpt-dir>/feat_cache_<backbone>. Put this on fast node-local "
-             "storage ($TMPDIR) for best throughput.",
-    )
-    p.add_argument(
-        "--precompute-batch", type=int, default=32,
-        help="Batch size for the one-time feature-cache precompute pass.",
-    )
-    p.add_argument(
-        "--amp", action="store_true",
-        help="Run the forward pass under bf16 autocast (A100/H100). Speeds up "
-             "training and lowers memory; loss/backward stay in fp32.",
-    )
-    p.add_argument(
-        "--backbone",
-        type=str,
-        default=C.DEFAULT_BACKBONE,
-        help="Image backbone, e.g. dinov2_vits14+cellpose4, dinov2_vits14+cellpose, or resnet18.",
-    )
-    p.add_argument(
-        "--no-pretrained",
-        action="store_true",
-        help="Disable ImageNet ResNet18 weights and Cellpose 4 cpsam weight loading "
-             "(DINOv2 still uses torch.hub weights).",
-    )
-    p.add_argument("--unfreeze-backbone", action="store_true")
+    p.add_argument("--feature-cache-dir", type=Path, default=None,
+                   help="Where to store/read the feature cache. Default: "
+                        "<ckpt-dir>/feat_cache_<backbone>.")
+    p.add_argument("--precompute-batch", type=int, default=32,
+                   help="Batch size for the one-time feature-cache precompute pass.")
+    p.add_argument("--amp", action="store_true",
+                   help="Run the forward pass under bf16 autocast (A100/H100). Loss/backward "
+                        "stay in fp32.")
+    p.add_argument("--backbone", type=str, default=C.DEFAULT_BACKBONE,
+                   help="Image backbone, e.g. dinov2_vits14+cellpose4, dinov2_vits14+cellpose, "
+                        "resnet18.")
+    p.add_argument("--no-pretrained", action="store_true",
+                   help="Disable ImageNet ResNet18 weights and Cellpose 4 cpsam weight loading "
+                        "(DINOv2 still uses torch.hub weights).")
+    p.add_argument("--unfreeze-backbone", action="store_true",
+                   help="Fine-tune the image backbone end-to-end (recommended on a single rig).")
     p.add_argument("--language-backend", choices=("hf", "simple"), default=C.LANGUAGE_BACKEND)
     p.add_argument("--text-model", type=str, default=C.DEFAULT_TEXT_MODEL)
     p.add_argument("--finetune", type=Path, default=None,
-                   help="Pretrained MicroVLA checkpoint to start from. "
-                        "Vocab and per-robot stats are extended to cover the "
-                        "current dataset; old IDs are preserved. Mutually "
-                        "exclusive with --resume in spirit (resume always wins "
-                        "if both are given).")
-    p.add_argument("--freeze-mode", choices=("none", "trunk", "head_only"),
-                   default="none",
-                   help="What to freeze on top of the always-frozen backbones. "
-                        "'trunk' freezes the main transformer + style encoder; "
-                        "'head_only' freezes everything except metadata "
-                        "embeddings, action head, and any LoRA params.")
+                   help="Pretrained MicroVLA checkpoint to start from. Vocab and per-robot stats "
+                        "are extended to cover the current dataset; old IDs are preserved. "
+                        "--resume wins if both are given.")
+    p.add_argument("--freeze-mode", choices=("none", "trunk", "head_only"), default="none",
+                   help="What to freeze on top of the (optionally frozen) backbone.")
     p.add_argument("--lora-r", type=int, default=0,
-                   help="LoRA rank applied to transformer FFN linears "
-                        "(linear1/linear2). 0 disables LoRA.")
+                   help="LoRA rank on transformer FFN linears (linear1/linear2). 0 disables LoRA.")
     p.add_argument("--lora-alpha", type=float, default=16.0)
     p.add_argument("--lora-targets", type=str, default="transformer,style_encoder",
-                   help="Comma-separated submodule names under policy.model "
-                        "to wrap with LoRA (e.g. 'transformer,style_encoder').")
+                   help="Comma-separated submodules under policy.model to wrap with LoRA.")
     p.add_argument("--lora-dropout", type=float, default=0.0)
     return p.parse_args()
 
@@ -160,20 +141,21 @@ def run_epoch(policy, loader, optimizer, device, train: bool, amp: bool = False)
         action = batch["action"].to(device, non_blocking=True)
         action_mask = batch["action_mask"].to(device, non_blocking=True)
         is_pad = batch["is_pad"].to(device, non_blocking=True)
+        goal = batch["goal"].to(device, non_blocking=True)
         robot_id = batch["robot_id"].to(device, non_blocking=True)
         lab_id = batch["lab_id"].to(device, non_blocking=True)
         embodiment_id = batch["embodiment_id"].to(device, non_blocking=True)
         action_type_id = batch["action_type_id"].to(device, non_blocking=True)
         task_family_id = batch["task_family_id"].to(device, non_blocking=True)
         instructions = batch["instruction"]
+        resistance = batch["resistance"].to(device, non_blocking=True) if "resistance" in batch else None
 
         # Either raw frames (decode path) or cached frozen-encoder features.
         if "primary_feat" in batch:
             image = None
             img_primary_feat = batch["primary_feat"].to(device, non_blocking=True)
             img_aux_feat = (
-                batch["aux_feat"].to(device, non_blocking=True)
-                if "aux_feat" in batch else None
+                batch["aux_feat"].to(device, non_blocking=True) if "aux_feat" in batch else None
             )
         else:
             image = batch["image"].to(device, non_blocking=True)
@@ -194,6 +176,8 @@ def run_epoch(policy, loader, optimizer, device, train: bool, amp: bool = False)
                 action_mask=action_mask,
                 actions=action,
                 is_pad=is_pad,
+                goal=goal,
+                resistance=resistance,
                 img_primary_feat=img_primary_feat,
                 img_aux_feat=img_aux_feat,
             )
@@ -223,7 +207,7 @@ def save_vla_checkpoint(path: Path, policy, optimizer, epoch: int, best_val: flo
             "config": {
                 "max_state_dim": C.MAX_STATE_DIM,
                 "max_action_dim": C.MAX_ACTION_DIM,
-                "chunk_size": C.CHUNK_SIZE,
+                "chunk_size": int(args.chunk_size),
                 "image_height": C.IMAGE_HEIGHT,
                 "image_width": C.IMAGE_WIDTH,
                 "backbone": args.backbone,
@@ -233,6 +217,9 @@ def save_vla_checkpoint(path: Path, policy, optimizer, epoch: int, best_val: flo
                 "dataset_repo_id": args.dataset_repo_id,
                 "pretrained_backbone": not args.no_pretrained,
                 "freeze_backbone": not args.unfreeze_backbone,
+                "goal_head": bool(args.goal_head),
+                "goal_weight": float(args.goal_weight),
+                "use_resistance": bool(policy.use_resistance),
                 "freeze_mode": args.freeze_mode,
                 "lora_r": int(args.lora_r),
                 "lora_alpha": float(args.lora_alpha),
@@ -241,6 +228,23 @@ def save_vla_checkpoint(path: Path, policy, optimizer, epoch: int, best_val: flo
             },
         },
         path,
+    )
+
+
+def _build_policy(stats, vocabs, args, use_resistance):
+    return build_vla_policy(
+        stats=stats,
+        vocabs=vocabs,
+        pretrained_backbone=not args.no_pretrained,
+        backbone_name=args.backbone,
+        freeze_backbone=not args.unfreeze_backbone,
+        language_backend=args.language_backend,
+        text_model_name=args.text_model,
+        action_space=args.action_space,
+        goal_weight=args.goal_weight,
+        goal_head=bool(args.goal_head),
+        chunk_size=int(args.chunk_size),
+        use_resistance=use_resistance,
     )
 
 
@@ -254,37 +258,36 @@ def main() -> None:
         device = "cpu"
 
     # Load a resume checkpoint early so the dataset is built with the SAME
-    # action space / dataset repo the run was started with.
+    # action space / chunk size / dataset the run was started with.
     resume_ckpt = None
     if args.resume is not None and args.resume.exists():
         resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        _rcfg0 = resume_ckpt.get("config", {})
-        if "action_space" in _rcfg0:
-            args.action_space = _rcfg0["action_space"]
-        if _rcfg0.get("dataset_repo_id") and args.dataset_repo_id is None:
-            args.dataset_repo_id = _rcfg0["dataset_repo_id"]
+        rcfg0 = resume_ckpt.get("config", {})
+        for attr in ("action_space", "chunk_size", "backbone", "goal_head"):
+            if attr in rcfg0:
+                setattr(args, attr, rcfg0[attr])
+        if rcfg0.get("dataset_repo_id"):
+            args.dataset_repo_id = rcfg0["dataset_repo_id"]
+    elif args.finetune is not None and args.finetune.exists():
+        # Match the pretrained chunk size / action space so weights line up.
+        fcfg = torch.load(args.finetune, map_location="cpu", weights_only=False).get("config", {})
+        for attr in ("action_space", "chunk_size", "goal_head"):
+            if attr in fcfg:
+                setattr(args, attr, fcfg[attr])
 
-    use_lerobot = args.dataset_repo_id is not None
-    if use_lerobot:
-        full_ds = build_lerobot_vla_dataset(
-            repo_id=args.dataset_repo_id,
-            root=args.dataset_root,
-            action_space=args.action_space,
-            chunk_size=C.CHUNK_SIZE,
-        )
-        print(f"loaded LeRobot dataset {args.dataset_repo_id} "
-              f"(robot_id={full_ds.episodes[0].robot_id!r}, action_space={args.action_space})")
-    else:
-        if args.action_space != "absolute":
-            print("[warn] legacy --episodes-dir loader trains on absolute actions; "
-                  "forcing --action-space absolute.")
-            args.action_space = "absolute"
-        stats_path = args.stats_path or (args.ckpt_dir / "vla_stats.pkl")
-        full_ds = build_vla_dataset(
-            episodes_dir=args.episodes_dir,
-            stats_path=stats_path,
-            recompute_stats=True,
-        )
+    if not args.dataset_repo_id:
+        raise SystemExit("--dataset-repo-id is required (MicroVLA trains from a LeRobot dataset).")
+
+    full_ds = build_lerobot_vla_dataset(
+        repo_id=args.dataset_repo_id,
+        root=args.dataset_root,
+        action_space=args.action_space,
+        chunk_size=int(args.chunk_size),
+    )
+    print(f"loaded LeRobot dataset {args.dataset_repo_id} "
+          f"(robot_id={full_ds.episodes[0].robot_id!r}, action_space={args.action_space}, "
+          f"chunk_size={args.chunk_size}, resistance={full_ds.has_resistance})")
+
     train_ds, val_ds, train_eps, val_eps = _episode_split(full_ds, args)
     val_names = [full_ds.episodes[i].episode_id for i in sorted(val_eps)]
     print(f"dataset: train={len(train_ds)} val={len(val_ds)} total={len(full_ds)}")
@@ -300,35 +303,20 @@ def main() -> None:
     val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
 
     # ------------------------------------------------------------------
-    # Policy construction. Three mutually-related modes:
-    #   * --resume <ckpt>   : continue a previous (possibly LoRA/frozen) run.
-    #                         Architecture (incl. freeze + LoRA) is rebuilt
-    #                         from the resumed checkpoint's saved config.
-    #   * --finetune <ckpt> : load a pretrained ckpt, extend vocabs+stats
-    #                         to cover the new dataset, partial-load weights,
-    #                         apply freezing + LoRA from CLI flags.
-    #   * neither           : build from scratch on the new dataset.
-    # If both --resume and --finetune are supplied, --resume wins.
+    # Policy construction:
+    #   --resume   : rebuild the exact prior architecture from its config.
+    #   --finetune : load pretrained ckpt, extend vocab+stats, partial-load.
+    #   neither    : build from scratch on this dataset.
     # ------------------------------------------------------------------
     if resume_ckpt is not None:
-        # Resume rebuilds the exact prior architecture. (Checkpoint already
-        # loaded near the top so the dataset matched its action space.)
         rcfg = resume_ckpt.get("config", {})
-        for attr in ("freeze_mode", "lora_r", "lora_alpha", "lora_targets", "lora_dropout", "action_space"):
+        for attr in ("freeze_mode", "lora_r", "lora_alpha", "lora_targets", "lora_dropout"):
             if attr in rcfg:
                 setattr(args, attr, rcfg[attr])
         full_ds.vocabs = VocabBundle(**resume_ckpt["vocabs"])
         full_ds.stats = resume_ckpt["stats"]
-        policy = build_vla_policy(
-            stats=full_ds.stats,
-            vocabs=full_ds.vocabs,
-            pretrained_backbone=not args.no_pretrained,
-            backbone_name=args.backbone,
-            freeze_backbone=not args.unfreeze_backbone,
-            language_backend=args.language_backend,
-            text_model_name=args.text_model,
-            action_space=args.action_space,
-        ).to(device)
+        use_resistance = bool(rcfg.get("use_resistance", full_ds.has_resistance))
+        policy = _build_policy(full_ds.stats, full_ds.vocabs, args, use_resistance).to(device)
         if args.freeze_mode != "none":
             apply_freeze_mode(policy, args.freeze_mode)
         if int(args.lora_r) > 0:
@@ -340,24 +328,16 @@ def main() -> None:
         print(f"[resume] loaded {args.resume}  ({parameter_summary(policy)})")
     elif args.finetune is not None and args.finetune.exists():
         pre = torch.load(args.finetune, map_location=device, weights_only=False)
+        pre_cfg = pre.get("config", {})
         pre_vocabs = VocabBundle(**pre["vocabs"]) if not isinstance(
             pre["vocabs"], VocabBundle) else pre["vocabs"]
         ext_vocabs = extend_vocabs(pre_vocabs, full_ds.episodes)
         merged = merge_stats(pre["stats"], full_ds.stats)
-        # Swap the dataset's view so per-sample IDs come from the extended vocab
-        # and per-robot normalization uses the merged stats.
         full_ds.vocabs = ext_vocabs
         full_ds.stats = merged
-        policy = build_vla_policy(
-            stats=merged,
-            vocabs=ext_vocabs,
-            pretrained_backbone=not args.no_pretrained,
-            backbone_name=args.backbone,
-            freeze_backbone=not args.unfreeze_backbone,
-            language_backend=args.language_backend,
-            text_model_name=args.text_model,
-            action_space=args.action_space,
-        ).to(device)
+        # Keep resistance support if either the pretrained model or the new data has it.
+        use_resistance = bool(pre_cfg.get("use_resistance", False) or full_ds.has_resistance)
+        policy = _build_policy(merged, ext_vocabs, args, use_resistance).to(device)
         load_finetune_state_dict(policy, pre["policy"], skip_patterns=("_table",))
         fill_robot_stats(policy, ext_vocabs, merged)
         if args.freeze_mode != "none":
@@ -370,55 +350,36 @@ def main() -> None:
         new_robots = sorted(set(ext_vocabs.robot_ids) - set(pre_vocabs.robot_ids))
         print(f"[finetune] loaded {args.finetune}; new robots in this dataset: {new_robots}")
     else:
-        policy = build_vla_policy(
-            stats=full_ds.stats,
-            vocabs=full_ds.vocabs,
-            pretrained_backbone=not args.no_pretrained,
-            backbone_name=args.backbone,
-            freeze_backbone=not args.unfreeze_backbone,
-            language_backend=args.language_backend,
-            text_model_name=args.text_model,
-            action_space=args.action_space,
-        ).to(device)
+        use_resistance = full_ds.has_resistance
+        policy = _build_policy(full_ds.stats, full_ds.vocabs, args, use_resistance).to(device)
     print(
         f"backbone: {args.backbone}  language={args.language_backend}:{args.text_model}  "
+        f"goal_head={args.goal_head}  resistance={policy.use_resistance}  "
         f"freeze={args.freeze_mode}  lora_r={args.lora_r}  {parameter_summary(policy)}"
     )
 
     # ------------------------------------------------------------------
-    # Optional frozen-encoder feature cache. Precompute the raw image-encoder
-    # features once, then every training step skips the per-frame video decode
-    # AND the frozen ViT forward passes. Only valid while the encoders stay
-    # frozen (disabled under --unfreeze-backbone).
+    # Optional frozen-encoder feature cache (skips video decode + frozen ViT).
     # ------------------------------------------------------------------
     if args.cache_features:
         if args.unfreeze_backbone:
-            print("[feature-cache] --unfreeze-backbone is set; encoder outputs "
-                  "change during training, so the cache would be stale. Disabling.")
-        elif not use_lerobot:
-            print("[feature-cache] only supported for the LeRobot loader "
-                  "(--dataset-repo-id); disabling.")
+            print("[feature-cache] --unfreeze-backbone is set; encoder outputs change during "
+                  "training, so the cache would be stale. Disabling.")
         else:
             cache_dir = args.feature_cache_dir or (
-                args.ckpt_dir
-                / f"feat_cache_{args.backbone.replace('+', '_').replace('/', '_')}"
+                args.ckpt_dir / f"feat_cache_{args.backbone.replace('+', '_').replace('/', '_')}"
             )
             image_hw = (C.IMAGE_HEIGHT, C.IMAGE_WIDTH)
             num_frames = int(full_ds.states_all.shape[0])
             feat_cache = FeatureCache.load_if_valid(
-                cache_dir,
-                repo_id=args.dataset_repo_id,
-                backbone_name=args.backbone,
-                image_hw=image_hw,
-                num_frames=num_frames,
+                cache_dir, repo_id=args.dataset_repo_id, backbone_name=args.backbone,
+                image_hw=image_hw, num_frames=num_frames,
             )
             if feat_cache is None:
                 feat_cache = FeatureCache.build(
                     cache_dir, full_ds, policy, device,
-                    repo_id=args.dataset_repo_id,
-                    backbone_name=args.backbone,
-                    image_hw=image_hw,
-                    batch_size=args.precompute_batch,
+                    repo_id=args.dataset_repo_id, backbone_name=args.backbone,
+                    image_hw=image_hw, batch_size=args.precompute_batch,
                 )
             full_ds.feature_cache = feat_cache
 
@@ -434,8 +395,6 @@ def main() -> None:
             try:
                 optimizer.load_state_dict(resume_ckpt["optimizer"])
             except (ValueError, KeyError) as e:
-                # Param shapes / counts differ from saved optimizer state.
-                # Falls back to a fresh optimizer.
                 print(f"[resume] optimizer state ignored ({e}); starting fresh AdamW state")
         start_epoch = int(resume_ckpt.get("epoch") or 0)
         best_val = float(resume_ckpt.get("best_val", best_val))
@@ -458,12 +417,7 @@ def main() -> None:
         if (epoch + 1) % args.save_every == 0:
             save_vla_checkpoint(
                 args.ckpt_dir / f"vla_policy_epoch{epoch+1}.pt",
-                policy,
-                optimizer,
-                epoch + 1,
-                best_val,
-                full_ds,
-                args,
+                policy, optimizer, epoch + 1, best_val, full_ds, args,
             )
 
     print(f"done. best val loss: {best_val:.4f}")

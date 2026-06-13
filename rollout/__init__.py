@@ -1,2 +1,2 @@
-"""Robot-side MicroACT rollout helpers."""
+"""Robot-side MicroVLA rollout helpers."""
 

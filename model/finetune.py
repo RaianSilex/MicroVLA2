@@ -6,7 +6,7 @@ Typical workflow:
     pre_vocabs = VocabBundle(**pretrained_ckpt["vocabs"])
     pre_stats = pretrained_ckpt["stats"]
 
-    new_ds = build_vla_dataset(...)                        # finetuner's data
+    new_ds = build_lerobot_vla_dataset(...)               # finetuner's data
     ext_vocabs = extend_vocabs(pre_vocabs, new_ds.episodes)
     merged = merge_stats(pre_stats, new_ds.stats)
 
@@ -31,7 +31,7 @@ import torch
 import torch.nn as nn
 
 from config import vla_config as C
-from data.vla_dataset import VLAEpisode, VocabBundle
+from data.vocab import VocabBundle
 
 
 # ---------------------------------------------------------------------------
@@ -52,8 +52,13 @@ def extend_vocab(old: Dict[str, int], new_values: Iterable[str]) -> Dict[str, in
     return out
 
 
-def extend_vocabs(old: VocabBundle, episodes: Sequence[VLAEpisode]) -> VocabBundle:
-    """Extend all five vocab dicts with whatever new entries the new episodes use."""
+def extend_vocabs(old: VocabBundle, episodes: Sequence) -> VocabBundle:
+    """Extend all five vocab dicts with whatever new entries the new episodes use.
+
+    ``episodes`` is any sequence of objects exposing ``robot_id`` / ``lab_id`` /
+    ``embodiment`` / ``action_type`` / ``task_family`` (VLAEpisode or
+    LeRobotEpisodeMeta).
+    """
     return VocabBundle(
         robot_ids=extend_vocab(old.robot_ids, (e.robot_id for e in episodes)),
         lab_ids=extend_vocab(old.lab_ids, (e.lab_id for e in episodes)),
@@ -64,13 +69,19 @@ def extend_vocabs(old: VocabBundle, episodes: Sequence[VLAEpisode]) -> VocabBund
 
 
 def merge_stats(old_stats: dict, new_stats: dict) -> dict:
-    """Combine per-robot stats. New stats win where the same robot appears in both."""
+    """Combine per-robot stats. New stats win where the same robot appears in both.
+
+    Per-robot dicts are copied whole, so ``action_weight`` / ``resistance_*`` ride
+    along automatically. ``has_resistance`` is the OR of both datasets.
+    """
     by_robot: Dict[str, dict] = dict(old_stats.get("by_robot", {}))
     by_robot.update(new_stats.get("by_robot", {}))
     return {
         "by_robot": by_robot,
         "image_mean": new_stats["image_mean"],
         "image_std": new_stats["image_std"],
+        "has_resistance": bool(old_stats.get("has_resistance", False)
+                               or new_stats.get("has_resistance", False)),
     }
 
 
@@ -94,6 +105,12 @@ def fill_robot_stats(policy: nn.Module, vocabs: VocabBundle, stats: dict) -> Non
                 rs["action_mean"]).to(policy.action_mean_table.device)
             policy.action_std_table[rid] = torch.from_numpy(
                 rs["action_std"]).to(policy.action_std_table.device)
+            if "action_weight" in rs:
+                policy.action_weight_table[rid] = torch.from_numpy(
+                    rs["action_weight"]).to(policy.action_weight_table.device)
+            if "resistance_mean" in rs:
+                policy.resistance_mean_table[rid, 0] = float(rs["resistance_mean"])
+                policy.resistance_std_table[rid, 0] = float(rs["resistance_std"])
 
 
 # ---------------------------------------------------------------------------
@@ -199,7 +216,7 @@ def apply_freeze_mode(policy: nn.Module, mode: str) -> None:
         freeze_modules(inner.transformer, inner.style_encoder)
         return
     if mode == "head_only":
-        freeze_modules(
+        modules = [
             inner.transformer,
             inner.style_encoder,
             inner.backbone,
@@ -213,7 +230,10 @@ def apply_freeze_mode(policy: nn.Module, mode: str) -> None:
             inner.qpos_to_src,
             inner.extra_src_pos,
             inner.query_embed,
-        )
+        ]
+        if getattr(inner, "use_resistance", False):
+            modules.append(inner.resistance_to_src)
+        freeze_modules(*modules)
         return
     raise ValueError(f"Unknown freeze mode: {mode!r}")
 

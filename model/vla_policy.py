@@ -1,4 +1,14 @@
-"""Policy wrapper for MicroVLA training and rollout."""
+"""Policy wrapper for MicroVLA training and rollout.
+
+Adds, around ``VLACVAE``:
+  * masked, **per-axis-weighted** L1 on the action chunk (near-constant axes are
+    down-weighted automatically from data; see ``action_weight_table``),
+  * a **contact-point** Gaussian negative-log-likelihood on the predicted goal,
+  * the CVAE KL term,
+  * optional resistance conditioning,
+  * raw-unit ``inference()`` that returns ABSOLUTE targets regardless of the
+    train-time action space.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +23,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from config import vla_config as C
-from data.vla_dataset import VocabBundle
+from data.vocab import VocabBundle
 from model.vla_cvae import VLACVAE
 
 
@@ -28,50 +38,66 @@ def _lookup(vocab: Dict[str, int], value: str) -> int:
 
 
 class VLAPolicy(nn.Module):
-    """Adds masked heterogeneous loss and raw-unit inference around VLACVAE."""
-
     def __init__(
         self,
         stats: dict,
         vocabs,
         kl_weight: float = C.KL_WEIGHT,
+        goal_weight: float = C.GOAL_LOSS_WEIGHT,
         action_space: str = C.DEFAULT_ACTION_SPACE,
+        use_resistance: Optional[bool] = None,
         **vla_kwargs,
     ):
         super().__init__()
         self.vocabs = _coerce_vocabs(vocabs)
         self.kl_weight = float(kl_weight)
+        self.goal_weight = float(goal_weight)
         # "delta": predictions are relative to the base state and added back at
         # inference so .inference() always returns ABSOLUTE targets (robot-native).
         # "absolute": predictions are absolute targets directly.
         self.action_space = str(action_space)
 
-        vla_kwargs.setdefault("num_robot_ids", len(self.vocabs.robot_ids))
+        # Auto-detect resistance support from the stats unless explicitly set.
+        if use_resistance is None:
+            use_resistance = bool(stats.get("has_resistance", False))
+        self.use_resistance = bool(use_resistance)
+
+        n_robots = len(self.vocabs.robot_ids)
+        vla_kwargs.setdefault("num_robot_ids", n_robots)
         vla_kwargs.setdefault("num_lab_ids", len(self.vocabs.lab_ids))
         vla_kwargs.setdefault("num_embodiment_ids", len(self.vocabs.embodiment_ids))
         vla_kwargs.setdefault("num_action_type_ids", len(self.vocabs.action_type_ids))
         vla_kwargs.setdefault("num_task_family_ids", len(self.vocabs.task_family_ids))
-        self.model = VLACVAE(**vla_kwargs)
+        self.model = VLACVAE(use_resistance=self.use_resistance, **vla_kwargs)
 
-        self.register_buffer("qpos_mean_table", torch.zeros(len(self.vocabs.robot_ids), C.MAX_STATE_DIM))
-        self.register_buffer("qpos_std_table", torch.ones(len(self.vocabs.robot_ids), C.MAX_STATE_DIM))
-        self.register_buffer("action_mean_table", torch.zeros(len(self.vocabs.robot_ids), C.MAX_ACTION_DIM))
-        self.register_buffer("action_std_table", torch.ones(len(self.vocabs.robot_ids), C.MAX_ACTION_DIM))
+        # Per-robot normalization tables.
+        self.register_buffer("qpos_mean_table", torch.zeros(n_robots, C.MAX_STATE_DIM))
+        self.register_buffer("qpos_std_table", torch.ones(n_robots, C.MAX_STATE_DIM))
+        self.register_buffer("action_mean_table", torch.zeros(n_robots, C.MAX_ACTION_DIM))
+        self.register_buffer("action_std_table", torch.ones(n_robots, C.MAX_ACTION_DIM))
+        # Per-axis loss weights (1.0 = neutral; near-0 for axes that don't move).
+        self.register_buffer("action_weight_table", torch.ones(n_robots, C.MAX_ACTION_DIM))
+        # Resistance normalization (scalar per robot).
+        self.register_buffer("resistance_mean_table", torch.zeros(n_robots, 1))
+        self.register_buffer("resistance_std_table", torch.ones(n_robots, 1))
+
+        by_robot = stats.get("by_robot", {})
         for robot_name, rid in self.vocabs.robot_ids.items():
-            if robot_name == C.UNKNOWN_TOKEN or robot_name not in stats["by_robot"]:
+            if robot_name == C.UNKNOWN_TOKEN or robot_name not in by_robot:
                 continue
-            robot_stats = stats["by_robot"][robot_name]
-            self.qpos_mean_table[rid] = torch.from_numpy(robot_stats["qpos_mean"])
-            self.qpos_std_table[rid] = torch.from_numpy(robot_stats["qpos_std"])
-            self.action_mean_table[rid] = torch.from_numpy(robot_stats["action_mean"])
-            self.action_std_table[rid] = torch.from_numpy(robot_stats["action_std"])
+            rs = by_robot[robot_name]
+            self.qpos_mean_table[rid] = torch.from_numpy(rs["qpos_mean"])
+            self.qpos_std_table[rid] = torch.from_numpy(rs["qpos_std"])
+            self.action_mean_table[rid] = torch.from_numpy(rs["action_mean"])
+            self.action_std_table[rid] = torch.from_numpy(rs["action_std"])
+            if "action_weight" in rs:
+                self.action_weight_table[rid] = torch.from_numpy(rs["action_weight"])
+            if "resistance_mean" in rs:
+                self.resistance_mean_table[rid, 0] = float(rs["resistance_mean"])
+                self.resistance_std_table[rid, 0] = float(rs["resistance_std"])
 
-        self.register_buffer(
-            "image_mean", torch.from_numpy(stats["image_mean"]).view(3, 1, 1)
-        )
-        self.register_buffer(
-            "image_std", torch.from_numpy(stats["image_std"]).view(3, 1, 1)
-        )
+        self.register_buffer("image_mean", torch.from_numpy(stats["image_mean"]).view(3, 1, 1))
+        self.register_buffer("image_std", torch.from_numpy(stats["image_std"]).view(3, 1, 1))
 
     def forward(
         self,
@@ -87,31 +113,12 @@ class VLAPolicy(nn.Module):
         action_mask: Optional[torch.Tensor] = None,
         actions: Optional[torch.Tensor] = None,
         is_pad: Optional[torch.Tensor] = None,
+        goal: Optional[torch.Tensor] = None,
+        resistance: Optional[torch.Tensor] = None,
         img_primary_feat: Optional[torch.Tensor] = None,
         img_aux_feat: Optional[torch.Tensor] = None,
     ):
-        if actions is not None:
-            if action_mask is None or is_pad is None:
-                raise ValueError("action_mask and is_pad are required for training")
-            a_hat, (mu, logvar) = self.model(
-                image,
-                qpos,
-                instructions,
-                robot_id,
-                lab_id,
-                embodiment_id,
-                action_type_id,
-                task_family_id,
-                state_mask=state_mask,
-                action_mask=action_mask,
-                actions=actions,
-                is_pad=is_pad,
-                img_primary_feat=img_primary_feat,
-                img_aux_feat=img_aux_feat,
-            )
-            return self._compute_loss(a_hat, actions, is_pad, action_mask, mu, logvar)
-
-        a_hat, _ = self.model(
+        a_hat, goal_params, (mu, logvar) = self.model(
             image,
             qpos,
             instructions,
@@ -122,9 +129,19 @@ class VLAPolicy(nn.Module):
             task_family_id,
             state_mask=state_mask,
             action_mask=action_mask,
+            actions=actions,
+            is_pad=is_pad,
             img_primary_feat=img_primary_feat,
             img_aux_feat=img_aux_feat,
+            resistance=resistance,
         )
+        if actions is not None:
+            if action_mask is None or is_pad is None:
+                raise ValueError("action_mask and is_pad are required for training")
+            axis_w = self.action_weight_table[robot_id]            # (B, MAX_ACTION_DIM)
+            return self._compute_loss(
+                a_hat, actions, is_pad, action_mask, axis_w, goal, goal_params, mu, logvar
+            )
         return a_hat
 
     def _compute_loss(
@@ -133,15 +150,35 @@ class VLAPolicy(nn.Module):
         actions: torch.Tensor,
         is_pad: torch.Tensor,
         action_mask: torch.Tensor,
+        axis_w: torch.Tensor,
+        goal: Optional[torch.Tensor],
+        goal_params,
         mu: torch.Tensor,
         logvar: torch.Tensor,
     ) -> dict:
-        l1_unreduced = F.l1_loss(a_hat, actions, reduction="none")
+        # Per-axis-weighted, masked L1 over the action chunk.
+        l1_unreduced = F.l1_loss(a_hat, actions, reduction="none")     # (B, k, A)
         valid = (~is_pad).unsqueeze(-1).float() * action_mask.unsqueeze(1).float()
-        l1 = (l1_unreduced * valid).sum() / valid.sum().clamp_min(1.0)
+        weight = valid * axis_w.unsqueeze(1)                           # (B, k, A)
+        l1 = (l1_unreduced * weight).sum() / weight.sum().clamp_min(1.0)
+
         kl = -0.5 * (1 + logvar - mu.pow(2) - logvar.exp()).sum(dim=-1).mean()
+
+        out = {"l1": l1.detach(), "kl": kl.detach()}
         total = l1 + self.kl_weight * kl
-        return {"loss": total, "l1": l1.detach(), "kl": kl.detach()}
+
+        if goal_params is not None and goal is not None:
+            goal_mu, goal_logvar = goal_params
+            var = goal_logvar.exp()
+            # Gaussian NLL (constant 0.5*log(2*pi) dropped); variance is learned.
+            nll = 0.5 * ((goal - goal_mu).pow(2) / var + goal_logvar)  # (B, A)
+            gmask = action_mask.float() * axis_w                        # (B, A)
+            goal_loss = (nll * gmask).sum() / gmask.sum().clamp_min(1.0)
+            total = total + self.goal_weight * goal_loss
+            out["goal"] = goal_loss.detach()
+
+        out["loss"] = total
+        return out
 
     @torch.no_grad()
     def inference(
@@ -156,6 +193,7 @@ class VLAPolicy(nn.Module):
         task_family: str = C.DEFAULT_TASK_FAMILY,
         state_dim: Optional[int] = None,
         action_dim: Optional[int] = None,
+        resistance: Optional[float] = None,
     ) -> np.ndarray:
         self.eval()
         device = self.qpos_mean_table.device
@@ -176,29 +214,27 @@ class VLAPolicy(nn.Module):
         state_mask_t = torch.from_numpy(state_mask).to(device).unsqueeze(0)
         action_mask_t = torch.from_numpy(action_mask).to(device).unsqueeze(0)
 
-        robot_id_t = torch.tensor([rid], dtype=torch.long, device=device)
-        lab_id_t = torch.tensor([_lookup(self.vocabs.lab_ids, lab_id)], dtype=torch.long, device=device)
-        embodiment_id_t = torch.tensor(
-            [_lookup(self.vocabs.embodiment_ids, embodiment)], dtype=torch.long, device=device
-        )
-        action_type_id_t = torch.tensor(
-            [_lookup(self.vocabs.action_type_ids, action_type)], dtype=torch.long, device=device
-        )
-        task_family_id_t = torch.tensor(
-            [_lookup(self.vocabs.task_family_ids, task_family)], dtype=torch.long, device=device
-        )
+        def _id(vocab, value):
+            return torch.tensor([_lookup(vocab, value)], dtype=torch.long, device=device)
+
+        resistance_t = None
+        if self.use_resistance:
+            r = 0.0 if resistance is None else float(resistance)
+            r = (r - float(self.resistance_mean_table[rid, 0])) / float(self.resistance_std_table[rid, 0])
+            resistance_t = torch.tensor([[r]], dtype=torch.float32, device=device)
 
         a_hat = self.forward(
             img,
             qpos_t,
             [instruction],
-            robot_id_t,
-            lab_id_t,
-            embodiment_id_t,
-            action_type_id_t,
-            task_family_id_t,
+            _id(self.vocabs.robot_ids, robot_id),
+            _id(self.vocabs.lab_ids, lab_id),
+            _id(self.vocabs.embodiment_ids, embodiment),
+            _id(self.vocabs.action_type_ids, action_type),
+            _id(self.vocabs.task_family_ids, task_family),
             state_mask=state_mask_t,
             action_mask=action_mask_t,
+            resistance=resistance_t,
         )
         a = a_hat[0] * self.action_std_table[rid] + self.action_mean_table[rid]
         if self.action_space == "delta":
@@ -222,7 +258,9 @@ def build_vla_policy(
     vocabs=None,
     stats_path: Path = C.VLA_STATS_PATH,
     kl_weight: float = C.KL_WEIGHT,
+    goal_weight: float = C.GOAL_LOSS_WEIGHT,
     action_space: str = C.DEFAULT_ACTION_SPACE,
+    use_resistance: Optional[bool] = None,
     **vla_kwargs,
 ) -> VLAPolicy:
     if stats is None or vocabs is None:
@@ -231,5 +269,11 @@ def build_vla_policy(
         stats = payload["stats"] if stats is None else stats
         vocabs = payload["vocabs"] if vocabs is None else vocabs
     return VLAPolicy(
-        stats=stats, vocabs=vocabs, kl_weight=kl_weight, action_space=action_space, **vla_kwargs
+        stats=stats,
+        vocabs=vocabs,
+        kl_weight=kl_weight,
+        goal_weight=goal_weight,
+        action_space=action_space,
+        use_resistance=use_resistance,
+        **vla_kwargs,
     )

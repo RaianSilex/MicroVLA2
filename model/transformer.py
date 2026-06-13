@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from config import config as C
+from config import vla_config as C
 
 
 def _clones(module: nn.Module, n: int) -> nn.ModuleList:

@@ -1,8 +1,7 @@
 """LeRobot-backed dataset for MicroVLA (SmolVLA / OpenPI-style data path).
 
 Reads a LeRobot-format dataset (local under HF_LEROBOT_HOME, or pulled from the
-HF Hub) and yields the **same per-sample dict** as ``data/vla_dataset.py`` so the
-rest of MicroVLA (``VLAPolicy``, ``train_vla.py``) is unchanged.
+HF Hub) and yields a per-sample dict consumed by ``VLAPolicy`` / ``train_vla.py``.
 
 The dataset is robot-native: it stores **ABSOLUTE** Sensapex targets. The action
 space used for training is chosen here:
@@ -12,11 +11,15 @@ space used for training is chosen here:
   (``VLAPolicy.inference``) back to absolute, so the robot side never changes.
 * ``"absolute"``: actions are the stored absolute targets.
 
-Normalization stats are computed over the realized action representation (so the
-far-future deltas in a chunk are scaled correctly) and over the absolute states.
+Each sample also carries:
+* ``goal``        — the episode's final reached target in the same action
+  representation (the contact point the tip heads toward), normalized; supervises
+  the policy's contact-point Gaussian head.
+* ``resistance``  — per-frame pipette resistance, ONLY when the dataset provides
+  ``observation.resistance``. Auto-detected; absent datasets train without it.
 
-Standard LeRobot feature keys are expected (see ``config/vla_config.py``):
-``observation.images.cam_main`` / ``observation.state`` / ``action`` + ``task``.
+Per-axis action weights (down-weighting near-constant axes) are computed from the
+realized action representation and stored in the per-robot stats.
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from config import vla_config as C
-from data.vla_dataset import VocabBundle
+from data.vocab import VocabBundle
 
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _IMAGENET_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -60,6 +63,25 @@ def _lookup(vocab: Dict[str, int], value: str) -> int:
     return int(vocab.get(str(value), vocab[C.UNKNOWN_TOKEN]))
 
 
+def _axis_weights(raw_std: np.ndarray, action_dim: int) -> np.ndarray:
+    """Per-axis loss weights from each dim's movement std.
+
+    Active axes land near 1.0; near-constant axes are floored to AXIS_WEIGHT_MIN so
+    they stop diluting the loss without being fully ignored. Padded dims get 0.
+    """
+    weight = np.zeros(C.MAX_ACTION_DIM, dtype=np.float32)
+    if not C.AXIS_WEIGHTING:
+        weight[:action_dim] = 1.0
+        return weight
+    rs = raw_std[:action_dim].astype(np.float64)
+    active = rs > 1e-6 * (rs.max() + 1e-9)
+    ref = np.median(rs[active]) if active.any() else 1.0
+    ref = ref if ref > 1e-9 else 1.0
+    w = np.clip(rs / ref, C.AXIS_WEIGHT_MIN, C.AXIS_WEIGHT_MAX)
+    weight[:action_dim] = w.astype(np.float32)
+    return weight
+
+
 def compute_lerobot_norm_stats(
     states_all: np.ndarray,        # (N, state_dim) absolute
     actions_all: np.ndarray,       # (N, action_dim) absolute targets
@@ -67,6 +89,7 @@ def compute_lerobot_norm_stats(
     action_space: str,
     chunk_size: int,
     robot_id: str,
+    resistance_all: Optional[np.ndarray] = None,   # (N,) or None
 ) -> dict:
     """Per-robot stats padded to MAX_*_DIM, in the chosen action space."""
     state_dim = states_all.shape[1]
@@ -79,10 +102,14 @@ def compute_lerobot_norm_stats(
 
     action_mean = np.zeros(C.MAX_ACTION_DIM, dtype=np.float32)
     action_std = np.ones(C.MAX_ACTION_DIM, dtype=np.float32)
+    raw_std = np.zeros(C.MAX_ACTION_DIM, dtype=np.float32)   # unclipped, for weights
 
     if action_space == "absolute":
-        action_mean[:action_dim] = actions_all.mean(0)
-        action_std[:action_dim] = np.clip(actions_all.std(0), 1e-2, None)
+        mean = actions_all.mean(0)
+        std = actions_all.std(0)
+        action_mean[:action_dim] = mean
+        action_std[:action_dim] = np.clip(std, 1e-2, None)
+        raw_std[:action_dim] = std
     elif action_space == "delta":
         # Accumulate over every realized chunk delta d[i] = action[t+i] - state[t].
         s = np.zeros(action_dim, dtype=np.float64)
@@ -101,23 +128,33 @@ def compute_lerobot_norm_stats(
         count = max(count, 1)
         mean = s / count
         var = np.clip(sq / count - mean * mean, 0.0, None)
+        std = np.sqrt(var)
         action_mean[:action_dim] = mean.astype(np.float32)
-        action_std[:action_dim] = np.clip(np.sqrt(var), 1e-2, None).astype(np.float32)
+        action_std[:action_dim] = np.clip(std, 1e-2, None).astype(np.float32)
+        raw_std[:action_dim] = std.astype(np.float32)
     else:
         raise ValueError(f"action_space must be 'delta' or 'absolute', got {action_space!r}")
 
+    robot_stats = {
+        "qpos_mean": qpos_mean,
+        "qpos_std": qpos_std,
+        "action_mean": action_mean,
+        "action_std": action_std,
+        "action_weight": _axis_weights(raw_std, action_dim),
+    }
+
+    has_resistance = resistance_all is not None
+    if has_resistance:
+        r = np.asarray(resistance_all, dtype=np.float32).reshape(-1)
+        robot_stats["resistance_mean"] = float(r.mean())
+        robot_stats["resistance_std"] = float(np.clip(r.std(), 1e-6, None))
+
     return {
-        "by_robot": {
-            robot_id: {
-                "qpos_mean": qpos_mean,
-                "qpos_std": qpos_std,
-                "action_mean": action_mean,
-                "action_std": action_std,
-            }
-        },
+        "by_robot": {robot_id: robot_stats},
         "image_mean": _IMAGENET_MEAN.copy(),
         "image_std": _IMAGENET_STD.copy(),
         "action_space": action_space,
+        "has_resistance": has_resistance,
     }
 
 
@@ -136,10 +173,13 @@ class LeRobotVLADataset(Dataset):
         chunk_size: int = C.CHUNK_SIZE,
         image_hw: tuple = (C.IMAGE_HEIGHT, C.IMAGE_WIDTH),
         camera_key: str = C.LEROBOT_CAMERA_KEY,
+        resistance_all: Optional[np.ndarray] = None,
     ):
         self.ds = lerobot_ds
         self.states_all = states_all
         self.actions_all = actions_all
+        self.resistance_all = resistance_all
+        self.has_resistance = resistance_all is not None
         self.episodes = episodes
         self.stats = stats
         self.vocabs = vocabs
@@ -202,14 +242,18 @@ class LeRobotVLADataset(Dataset):
         g = g0 + t
 
         state_raw = self.states_all[g]                     # (state_dim,) absolute
+        base = state_raw[: self.action_dim][None, :]       # (1, action_dim)
 
         end = min(t + self.chunk_size, ep.length)
         avail = end - t
         abs_targets = self.actions_all[g0 + t: g0 + end]   # (avail, action_dim) absolute
+        abs_final = self.actions_all[g0 + ep.length - 1]   # (action_dim,) contact point
         if self.action_space == "delta":
-            chunk = abs_targets - state_raw[: self.action_dim][None, :]
+            chunk = abs_targets - base
+            goal_raw = abs_final - base[0]
         else:
             chunk = abs_targets
+            goal_raw = abs_final
 
         qpos = np.zeros(C.MAX_STATE_DIM, dtype=np.float32)
         qpos[: self.state_dim] = state_raw
@@ -223,10 +267,15 @@ class LeRobotVLADataset(Dataset):
         is_pad = np.zeros(self.chunk_size, dtype=bool)
         is_pad[avail:] = True
 
+        goal = np.zeros(C.MAX_ACTION_DIM, dtype=np.float32)
+        goal[: self.action_dim] = goal_raw
+
         qpos_n = (qpos - robot_stats["qpos_mean"]) / robot_stats["qpos_std"]
         action_n = (action - robot_stats["action_mean"]) / robot_stats["action_std"]
+        goal_n = (goal - robot_stats["action_mean"]) / robot_stats["action_std"]
         action_n[is_pad] = 0.0
         action_n[:, ~action_mask] = 0.0
+        goal_n[~action_mask] = 0.0
         qpos_n[~state_mask] = 0.0
 
         ids = self._ids[ei]
@@ -236,6 +285,7 @@ class LeRobotVLADataset(Dataset):
             "action": torch.from_numpy(action_n).float(),
             "action_mask": torch.from_numpy(action_mask),
             "is_pad": torch.from_numpy(is_pad),
+            "goal": torch.from_numpy(goal_n).float(),
             "instruction": ep.instruction,
             "robot_id": torch.tensor(ids["robot_id"], dtype=torch.long),
             "lab_id": torch.tensor(ids["lab_id"], dtype=torch.long),
@@ -245,6 +295,10 @@ class LeRobotVLADataset(Dataset):
             "episode_index": torch.tensor(ei, dtype=torch.long),
             "timestep": torch.tensor(t, dtype=torch.long),
         }
+        if self.has_resistance:
+            r = float(self.resistance_all[g])
+            r = (r - robot_stats["resistance_mean"]) / robot_stats["resistance_std"]
+            sample["resistance"] = torch.tensor([r], dtype=torch.float32)
         if self.feature_cache is not None:
             # Cached raw encoder features → no video decode this step.
             primary_feat, aux_feat = self.feature_cache.get(g)
@@ -273,6 +327,7 @@ def build_lerobot_vla_dataset(
     this single-rig dataset; language (the per-episode ``task``) is the real
     conditioning signal. ``robot_id`` defaults to the dataset's ``robot_type`` and
     must match the rollout adapter's ``robot_id`` so per-robot stats line up.
+    A per-frame ``observation.resistance`` feature is used automatically if present.
     """
     from lerobot.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
 
@@ -285,6 +340,12 @@ def build_lerobot_vla_dataset(
     # Bulk-read absolute state/action columns (cheap; does not decode images).
     states_all = np.asarray(ds.hf_dataset[C.LEROBOT_STATE_KEY], dtype=np.float32)
     actions_all = np.asarray(ds.hf_dataset[C.LEROBOT_ACTION_KEY], dtype=np.float32)
+
+    resistance_all = None
+    if C.LEROBOT_RESISTANCE_KEY in ds.hf_dataset.column_names:
+        resistance_all = np.asarray(
+            ds.hf_dataset[C.LEROBOT_RESISTANCE_KEY], dtype=np.float32
+        ).reshape(-1)
 
     episodes: List[LeRobotEpisodeMeta] = []
     for row in ds.meta.episodes:
@@ -314,7 +375,8 @@ def build_lerobot_vla_dataset(
         task_family_ids=_make_single_vocab(task_family),
     )
     stats = compute_lerobot_norm_stats(
-        states_all, actions_all, episodes, action_space, chunk_size, robot_id
+        states_all, actions_all, episodes, action_space, chunk_size, robot_id,
+        resistance_all=resistance_all,
     )
     return LeRobotVLADataset(
         lerobot_ds=ds,
@@ -325,4 +387,5 @@ def build_lerobot_vla_dataset(
         vocabs=vocabs,
         action_space=action_space,
         chunk_size=chunk_size,
+        resistance_all=resistance_all,
     )

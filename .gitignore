@@ -61,5 +61,7 @@ Thumbs.db
 
 # transient runtime artifacts
 .claude/
-microact_live.png
-microact_live.tmp.png
+.agents/
+checkpoints_vla/
+microvla_live.png
+microvla_live.tmp.png

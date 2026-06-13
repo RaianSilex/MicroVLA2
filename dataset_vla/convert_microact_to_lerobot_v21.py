@@ -45,7 +45,6 @@ for _p in (str(REPO_ROOT), str(Path(__file__).resolve().parent)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-from config import config as ACT
 from config import vla_config as C
 
 # Reuse the EXACT instruction + image logic from the v3.0 converter so the two
@@ -251,8 +250,8 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Convert MicroACT trials to a LeRobot v2.1 dataset (OpenPI-compatible)."
     )
-    p.add_argument("--data-root", type=Path, default=ACT.DATASET_ROOT)
-    p.add_argument("--labels", type=Path, default=ACT.DATASET_ROOT / "instruction_labels.csv")
+    p.add_argument("--data-root", type=Path, default=C.DATASET_ROOT)
+    p.add_argument("--labels", type=Path, default=C.DATASET_ROOT / "instruction_labels.csv")
     p.add_argument("--repo-id", type=str, default=f"{C.DEFAULT_DATASET_REPO_ID}_v21",
                    help="Destination repo id. Defaults to the v3.0 repo id + '_v21' so the "
                         "two datasets live in separate repos.")

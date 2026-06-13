@@ -1,12 +1,18 @@
 """Vision-language-action CVAE for heterogeneous micromanipulation.
 
-This keeps the ACT action-chunking decoder, but conditions the transformer on:
+Keeps the ACT action-chunking decoder, conditioned on:
 
     image tokens + instruction tokens + padded robot state + embodiment metadata
+    (+ an optional pipette-resistance token, when the dataset provides it)
 
-The output is always padded to MAX_ACTION_DIM. The policy wrapper masks invalid
-action dimensions so single- and dual-manipulator demonstrations can train
-together.
+On top of the action chunk it also predicts a **contact-point Gaussian**: the
+mean + per-dim log-variance of the episode's final reached target (the point the
+tip is heading toward). A dedicated decoder "goal query" produces it, and the
+trajectory queries attend to that goal query in the decoder self-attention, so
+the chunk is goal-conditioned in a single forward pass.
+
+The output is always padded to MAX_ACTION_DIM; the policy wrapper masks invalid
+action dimensions so single- and dual-manipulator demonstrations train together.
 """
 
 from __future__ import annotations
@@ -18,10 +24,14 @@ import torch.nn as nn
 
 from config import vla_config as C
 from model.backbone import build_backbone
-from model.cvae import reparameterize
 from model.embodiment import EmbodimentConditioner
 from model.language_encoder import build_language_encoder
 from model.transformer import build_encoder, build_transformer
+
+
+def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    std = (0.5 * logvar).exp()
+    return mu + torch.randn_like(std) * std
 
 
 class VLACVAE(nn.Module):
@@ -44,6 +54,9 @@ class VLACVAE(nn.Module):
         num_embodiment_ids: int = C.NUM_EMBODIMENT_IDS_FALLBACK,
         num_action_type_ids: int = C.NUM_ACTION_TYPE_IDS_FALLBACK,
         num_task_family_ids: int = C.NUM_TASK_FAMILY_IDS_FALLBACK,
+        goal_head: bool = C.GOAL_HEAD,
+        use_resistance: bool = False,
+        resistance_dropout: float = C.RESISTANCE_DROPOUT,
     ):
         super().__init__()
         self.state_dim = int(state_dim)
@@ -53,6 +66,9 @@ class VLACVAE(nn.Module):
         self.chunk_size = int(chunk_size)
         self.num_cameras = int(num_cameras)
         self.max_language_tokens = int(max_language_tokens)
+        self.goal_head_enabled = bool(goal_head)
+        self.use_resistance = bool(use_resistance)
+        self.resistance_dropout = float(resistance_dropout)
 
         self.backbone = build_backbone(
             hidden_dim=hidden_dim,
@@ -86,12 +102,21 @@ class VLACVAE(nn.Module):
 
         self.latent_to_src = nn.Linear(latent_dim, hidden_dim)
         self.qpos_to_src = nn.Linear(state_dim, hidden_dim)
+        if self.use_resistance:
+            self.resistance_to_src = nn.Linear(1, hidden_dim)
 
-        self.num_non_image_tokens = 2 + self.embodiment.num_tokens + self.max_language_tokens
+        # Non-image source tokens: latent, qpos, [resistance], meta(5), language.
+        self.num_fixed_src = 2 + (1 if self.use_resistance else 0) + self.embodiment.num_tokens
+        self.num_non_image_tokens = self.num_fixed_src + self.max_language_tokens
         self.extra_src_pos = nn.Embedding(self.num_non_image_tokens, hidden_dim)
 
-        self.query_embed = nn.Embedding(chunk_size, hidden_dim)
+        # Decoder queries: chunk_size trajectory queries (+1 goal query if enabled).
+        num_queries = chunk_size + (1 if self.goal_head_enabled else 0)
+        self.query_embed = nn.Embedding(num_queries, hidden_dim)
         self.action_head = nn.Linear(hidden_dim, action_dim)
+        if self.goal_head_enabled:
+            # Predicts (mu, logvar) over the contact point in action representation.
+            self.goal_head = nn.Linear(hidden_dim, 2 * action_dim)
 
     def _encode_style(
         self,
@@ -163,7 +188,13 @@ class VLACVAE(nn.Module):
         is_pad: Optional[torch.Tensor] = None,
         img_primary_feat: Optional[torch.Tensor] = None,
         img_aux_feat: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        resistance: Optional[torch.Tensor] = None,
+    ):
+        """Returns (a_hat, goal_params, (mu, logvar)).
+
+        ``goal_params`` is ``(goal_mu, goal_logvar)`` (each ``(B, action_dim)``) when
+        the goal head is enabled, else ``None``.
+        """
         B = qpos.size(0)
         device = qpos.device
 
@@ -188,16 +219,24 @@ class VLACVAE(nn.Module):
 
         latent_tok = self.latent_to_src(z).unsqueeze(0)
         qpos_tok = self.qpos_to_src(qpos).unsqueeze(0)
-        non_image = torch.cat([latent_tok, qpos_tok, meta_tokens, lang_tokens], dim=0)
+        fixed_toks = [latent_tok, qpos_tok]
+        if self.use_resistance:
+            if resistance is None:
+                resistance = torch.zeros(B, 1, device=device, dtype=qpos.dtype)
+            else:
+                resistance = resistance.to(device=device, dtype=qpos.dtype).reshape(B, 1)
+                if self.training and self.resistance_dropout > 0:
+                    keep = (torch.rand(B, 1, device=device) >= self.resistance_dropout).float()
+                    resistance = resistance * keep
+            fixed_toks.append(self.resistance_to_src(resistance).unsqueeze(0))
+        non_image = torch.cat([*fixed_toks, meta_tokens, lang_tokens], dim=0)
         src = torch.cat([non_image, img_feat], dim=0)
 
         pos_non_image = self.extra_src_pos.weight[: non_image.size(0)]
         pos_non_image = pos_non_image.unsqueeze(1).expand(-1, B, -1)
         src_pos = torch.cat([pos_non_image, img_pos], dim=0)
 
-        fixed_valid = torch.zeros(
-            B, 2 + self.embodiment.num_tokens, dtype=torch.bool, device=device
-        )
+        fixed_valid = torch.zeros(B, self.num_fixed_src, dtype=torch.bool, device=device)
         img_valid = torch.zeros(B, img_feat.size(0), dtype=torch.bool, device=device)
         src_key_padding_mask = torch.cat([fixed_valid, lang_pad, img_valid], dim=1)
 
@@ -206,11 +245,23 @@ class VLACVAE(nn.Module):
             src_pos,
             self.query_embed.weight,
             src_key_padding_mask=src_key_padding_mask,
-        )
-        a_hat = self.action_head(hs.transpose(0, 1))
+        )  # (num_queries, B, D)
+
+        action_hs = hs[: self.chunk_size]
+        a_hat = self.action_head(action_hs.transpose(0, 1))
         if action_mask is not None:
             a_hat = a_hat * action_mask[:, None, :].float()
-        return a_hat, (mu, logvar)
+
+        goal_params = None
+        if self.goal_head_enabled:
+            goal_out = self.goal_head(hs[self.chunk_size])           # (B, 2*action_dim)
+            goal_mu, goal_logvar = goal_out.chunk(2, dim=-1)
+            goal_logvar = goal_logvar.clamp(C.GOAL_LOGVAR_MIN, C.GOAL_LOGVAR_MAX)
+            if action_mask is not None:
+                goal_mu = goal_mu * action_mask.float()
+            goal_params = (goal_mu, goal_logvar)
+
+        return a_hat, goal_params, (mu, logvar)
 
 
 def build_vla_cvae(**kwargs) -> VLACVAE:

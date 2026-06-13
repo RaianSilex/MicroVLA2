@@ -49,12 +49,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from config import config as ACT
 from config import vla_config as C
 
-STATE_COLS = list(ACT.CSV_STATE_COLS)
-ACTION_COLS = list(ACT.CSV_ACTION_COLS)
-IMAGE_COL = ACT.CSV_IMAGE_COL
+STATE_COLS = list(C.CSV_STATE_COLS)
+ACTION_COLS = list(C.CSV_ACTION_COLS)
+IMAGE_COL = C.CSV_IMAGE_COL
+RESISTANCE_COL = C.CSV_RESISTANCE_COL
 
 
 # ---------------------------------------------------------------------------
@@ -229,6 +229,30 @@ def _resize_exact(img: np.ndarray, out_h: int, out_w: int) -> np.ndarray:
     return np.asarray(Image.fromarray(img).resize((out_w, out_h), Image.BILINEAR), dtype=np.uint8)
 
 
+def _trial_resistance(df: pd.DataFrame) -> Optional[np.ndarray]:
+    """Per-row resistance for one trial as float32, or None if the column has no
+    usable values. Missing cells become 0.0."""
+    if RESISTANCE_COL not in df.columns:
+        return None
+    col = pd.to_numeric(df[RESISTANCE_COL], errors="coerce")
+    if not np.isfinite(col.to_numpy(dtype=np.float64)).any():
+        return None
+    return col.fillna(0.0).to_numpy(dtype=np.float32)
+
+
+def _dataset_has_resistance(csv_files: list[Path]) -> bool:
+    """True if ANY trial carries real resistance values (so the whole dataset
+    gets the optional observation.resistance feature)."""
+    for p in csv_files:
+        try:
+            df = pd.read_csv(p, usecols=[RESISTANCE_COL])
+        except (ValueError, KeyError):
+            continue
+        if _trial_resistance(df) is not None:
+            return True
+    return False
+
+
 def _resolve_image_path(raw: str, data_root: Path, frames_dir: Path, trial_id: int, t: int) -> Optional[Path]:
     raw = (raw or "").strip()
     fallback = frames_dir / f"trial_{trial_id}" / f"frame_{t:06d}.png"
@@ -275,6 +299,18 @@ def main() -> None:
         else:
             raise FileExistsError(f"{out_root} exists; pass --overwrite to rebuild it.")
 
+    # Optional: pipette resistance, included only if the raw logs carry real values.
+    has_resistance = args.resistance and _dataset_has_resistance(csv_files)
+    features = {
+        C.LEROBOT_CAMERA_KEY: {"dtype": "image", "shape": (args.down_h, args.down_w, 3),
+                               "names": ["height", "width", "channel"]},
+        C.LEROBOT_STATE_KEY: {"dtype": "float32", "shape": (len(STATE_COLS),), "names": ["state"]},
+        C.LEROBOT_ACTION_KEY: {"dtype": "float32", "shape": (len(ACTION_COLS),), "names": ["action"]},
+    }
+    if has_resistance:
+        features[C.LEROBOT_RESISTANCE_KEY] = {"dtype": "float32", "shape": (1,), "names": ["resistance"]}
+        print(f"[resistance] found values -> adding feature {C.LEROBOT_RESISTANCE_KEY!r}")
+
     out_hw = (args.down_h, args.down_w)
     ds = LeRobotDataset.create(
         repo_id=args.repo_id,
@@ -282,12 +318,7 @@ def main() -> None:
         root=out_root,
         robot_type=args.robot_type,
         use_videos=False,  # store frames as PNG (no ffmpeg/av needed)
-        features={
-            C.LEROBOT_CAMERA_KEY: {"dtype": "image", "shape": (args.down_h, args.down_w, 3),
-                                   "names": ["height", "width", "channel"]},
-            C.LEROBOT_STATE_KEY: {"dtype": "float32", "shape": (len(STATE_COLS),), "names": ["state"]},
-            C.LEROBOT_ACTION_KEY: {"dtype": "float32", "shape": (len(ACTION_COLS),), "names": ["action"]},
-        },
+        features=features,
         image_writer_threads=args.image_writer_threads,
         image_writer_processes=args.image_writer_processes,
     )
@@ -328,6 +359,10 @@ def main() -> None:
         instruction, region = resolve_instruction(trial_id, labels)
         region_counts[region] = region_counts.get(region, 0) + 1
 
+        resist = _trial_resistance(df) if has_resistance else None
+        if has_resistance and resist is None:
+            resist = np.zeros(len(df), dtype=np.float32)
+
         raw_paths = (
             df[IMAGE_COL].astype(str).tolist() if IMAGE_COL in df.columns else [""] * len(df)
         )
@@ -340,12 +375,15 @@ def main() -> None:
                 )
             img = _load_rgb_uint8(src)
             img = (_resize_letterbox(img, *out_hw) if args.keep_aspect else _resize_exact(img, *out_hw))
-            ds.add_frame({
+            frame = {
                 C.LEROBOT_CAMERA_KEY: img,
                 C.LEROBOT_STATE_KEY: states[t],
                 C.LEROBOT_ACTION_KEY: actions[t],
                 "task": instruction,
-            })
+            }
+            if has_resistance:
+                frame[C.LEROBOT_RESISTANCE_KEY] = np.array([resist[t]], dtype=np.float32)
+            ds.add_frame(frame)
             wrote += 1
         ds.save_episode()
         total_rows += wrote
@@ -377,8 +415,8 @@ def main() -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Convert MicroACT trials to a LeRobot dataset.")
-    p.add_argument("--data-root", type=Path, default=ACT.DATASET_ROOT)
-    p.add_argument("--labels", type=Path, default=ACT.DATASET_ROOT / "instruction_labels.csv")
+    p.add_argument("--data-root", type=Path, default=C.DATASET_ROOT)
+    p.add_argument("--labels", type=Path, default=C.DATASET_ROOT / "instruction_labels.csv")
     p.add_argument("--repo-id", type=str, default=C.DEFAULT_DATASET_REPO_ID)
     p.add_argument("--root", type=Path, default=None,
                    help="Output base dir for the LeRobot repo. Default: HF_LEROBOT_HOME.")
@@ -393,6 +431,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-keep-aspect", dest="keep_aspect", action="store_false")
     p.add_argument("--fix-uninitialized-targets", action="store_true", default=True)
     p.add_argument("--no-fix-uninitialized-targets", dest="fix_uninitialized_targets", action="store_false")
+    p.add_argument("--resistance", action="store_true", default=True,
+                   help="Auto-include observation.resistance when the logs carry real values.")
+    p.add_argument("--no-resistance", dest="resistance", action="store_false")
     p.add_argument("--limit-trials", type=int, default=0, help="0 = all; >0 for quick smoke tests.")
     p.add_argument("--image-writer-threads", type=int, default=8)
     p.add_argument("--image-writer-processes", type=int, default=0)
