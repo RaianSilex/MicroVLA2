@@ -62,7 +62,7 @@ def evaluate(policy, dataset, device, num_samples: int = 64, seed: int = 0) -> d
     batch = _move(default_collate([dataset[int(i)] for i in idx]), device)
 
     image = batch.get("image")
-    a_hat, goal_params, _ = policy.model(
+    a_hat, goal_params, cell_params, _ = policy.model(
         image,
         batch["qpos"],
         batch["instruction"],
@@ -120,6 +120,18 @@ def evaluate(policy, dataset, device, num_samples: int = 64, seed: int = 0) -> d
                   f"true std={goal_gt[:, a].std():.3f})")
         metrics["goal_corr"] = corrs
 
+    if cell_params is not None and "goal_pixel" in batch and "target_region" in batch:
+        select_logits, cell_mu, _ = cell_params
+        pred_region = select_logits.argmax(dim=-1)
+        true_region = batch["target_region"]
+        sel_acc = float((pred_region == true_region).float().mean())
+        pix_err = float((cell_mu - batch["goal_pixel"]).abs().mean())
+        print("\n=== cell-aware heads (Variant B) ===")
+        print(f"  selection accuracy: {sel_acc:.2f}  (chance ~{1.0 / select_logits.shape[-1]:.2f})")
+        print(f"  contact-point |pred-true| (normalized px): {pix_err:.3f}")
+        metrics["cell_select_acc"] = sel_acc
+        metrics["cell_pixel_err"] = pix_err
+
     return metrics
 
 
@@ -138,6 +150,7 @@ def load_policy(checkpoint: Path, device: str):
         chunk_size=int(cfg.get("chunk_size", C.CHUNK_SIZE)),
         goal_head=bool(cfg.get("goal_head", C.GOAL_HEAD)),
         use_resistance=bool(cfg.get("use_resistance", False)),
+        cell_head=bool(cfg.get("cell_head", False)),
     ).to(device)
     policy.load_state_dict(ckpt["policy"])
     policy.eval()

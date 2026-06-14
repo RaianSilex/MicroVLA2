@@ -240,6 +240,37 @@ def _trial_resistance(df: pd.DataFrame) -> Optional[np.ndarray]:
     return col.fillna(0.0).to_numpy(dtype=np.float32)
 
 
+def load_cell_labels(path: Path) -> dict[int, tuple[float, float]]:
+    """Read the Cellpose teacher's contact-point labels (Variant B).
+
+    Expects a CSV with columns ``trial_id, goal_u, goal_v`` where ``goal_u`` /
+    ``goal_v`` are the target cell's contact point in NORMALIZED image pixels
+    ([0, 1]; u horizontal, v vertical), written by
+    ``dataset_vla/generate_cell_labels.py``. Returns ``{trial_id: (u, v)}`` for
+    rows with finite, in-range values; returns ``{}`` if the file is absent or
+    has no usable rows (the converter then simply omits the optional feature).
+    """
+    if not path.exists():
+        return {}
+    df = pd.read_csv(path)
+    needed = {"trial_id", "goal_u", "goal_v"}
+    if not needed.issubset(df.columns):
+        print(f"[cells] {path} missing columns {needed - set(df.columns)}; ignoring.")
+        return {}
+    out: dict[int, tuple[float, float]] = {}
+    for _, row in df.iterrows():
+        try:
+            tid = int(row["trial_id"])
+            u = float(row["goal_u"])
+            v = float(row["goal_v"])
+        except (TypeError, ValueError):
+            continue
+        if not (np.isfinite(u) and np.isfinite(v)):
+            continue
+        out[tid] = (float(np.clip(u, 0.0, 1.0)), float(np.clip(v, 0.0, 1.0)))
+    return out
+
+
 def _dataset_has_resistance(csv_files: list[Path]) -> bool:
     """True if ANY trial carries real resistance values (so the whole dataset
     gets the optional observation.resistance feature)."""
@@ -291,6 +322,9 @@ def main() -> None:
 
     labels = load_or_scaffold_labels(args.labels.expanduser().resolve(), trial_ids)
 
+    # Optional (Variant B): Cellpose teacher contact-point labels in normalized px.
+    cell_labels = load_cell_labels(args.cell_labels.expanduser().resolve()) if args.cells else {}
+
     out_root = (Path(args.root).expanduser().resolve() / args.repo_id) if args.root else (HF_LEROBOT_HOME / args.repo_id)
     if out_root.exists():
         if args.overwrite:
@@ -310,6 +344,13 @@ def main() -> None:
     if has_resistance:
         features[C.LEROBOT_RESISTANCE_KEY] = {"dtype": "float32", "shape": (1,), "names": ["resistance"]}
         print(f"[resistance] found values -> adding feature {C.LEROBOT_RESISTANCE_KEY!r}")
+
+    # Optional (Variant B): per-episode contact point in normalized pixels (u, v).
+    has_cells = bool(cell_labels)
+    if has_cells:
+        features[C.LEROBOT_GOAL_PIXEL_KEY] = {"dtype": "float32", "shape": (2,), "names": ["goal_pixel"]}
+        print(f"[cells] found {len(cell_labels)} contact-point label(s) -> "
+              f"adding feature {C.LEROBOT_GOAL_PIXEL_KEY!r}")
 
     out_hw = (args.down_h, args.down_w)
     ds = LeRobotDataset.create(
@@ -363,6 +404,13 @@ def main() -> None:
         if has_resistance and resist is None:
             resist = np.zeros(len(df), dtype=np.float32)
 
+        if has_cells:
+            gp = cell_labels.get(trial_id)
+            if gp is None:
+                gp = (0.5, 0.5)
+                print(f"[cells] trial_{trial_id}: no contact-point label; defaulting to center.")
+            goal_pixel = np.asarray(gp, dtype=np.float32)
+
         raw_paths = (
             df[IMAGE_COL].astype(str).tolist() if IMAGE_COL in df.columns else [""] * len(df)
         )
@@ -383,6 +431,8 @@ def main() -> None:
             }
             if has_resistance:
                 frame[C.LEROBOT_RESISTANCE_KEY] = np.array([resist[t]], dtype=np.float32)
+            if has_cells:
+                frame[C.LEROBOT_GOAL_PIXEL_KEY] = goal_pixel  # per-episode contact point
             ds.add_frame(frame)
             wrote += 1
         ds.save_episode()
@@ -395,6 +445,7 @@ def main() -> None:
     print(f"episodes={len(csv_files)}  frames={total_rows}")
     print(f"region_counts={region_counts}")
     print(f"robot_type={args.robot_type}  fps={args.fps}  image={args.down_h}x{args.down_w}")
+    print(f"resistance={has_resistance}  cell_labels={has_cells}")
     print(f"local dataset: {out_root}")
     if len(region_counts) <= 1:
         print("[warn] all trials share one region -> language won't vary. "
@@ -434,6 +485,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resistance", action="store_true", default=True,
                    help="Auto-include observation.resistance when the logs carry real values.")
     p.add_argument("--no-resistance", dest="resistance", action="store_false")
+    p.add_argument("--cell-labels", type=Path, default=C.DATASET_ROOT / "cell_labels.csv",
+                   help="Cellpose teacher contact-point labels (trial_id, goal_u, goal_v) for "
+                        "Variant B. Generate with dataset_vla/generate_cell_labels.py.")
+    p.add_argument("--cells", action="store_true", default=True,
+                   help="Auto-include observation.goal_pixel when --cell-labels exists.")
+    p.add_argument("--no-cells", dest="cells", action="store_false")
     p.add_argument("--limit-trials", type=int, default=0, help="0 = all; >0 for quick smoke tests.")
     p.add_argument("--image-writer-threads", type=int, default=8)
     p.add_argument("--image-writer-processes", type=int, default=0)

@@ -11,6 +11,13 @@ tip is heading toward). A dedicated decoder "goal query" produces it, and the
 trajectory queries attend to that goal query in the decoder self-attention, so
 the chunk is goal-conditioned in a single forward pass.
 
+Optionally (Variant B, when the dataset carries a Cellpose-generated
+``goal_pixel`` label) a second dedicated "cell query" drives two AUXILIARY heads:
+a cell-SELECTION head (which grid region holds the target cell) and an image-space
+contact-point GAUSSIAN head (the target cell's (u, v) in [0, 1]). These shape the
+image features to be cell-aware but do NOT feed the action head, so inference is
+backbone-only — no Cellpose in the loop.
+
 The output is always padded to MAX_ACTION_DIM; the policy wrapper masks invalid
 action dimensions so single- and dual-manipulator demonstrations train together.
 """
@@ -57,6 +64,8 @@ class VLACVAE(nn.Module):
         goal_head: bool = C.GOAL_HEAD,
         use_resistance: bool = False,
         resistance_dropout: float = C.RESISTANCE_DROPOUT,
+        cell_head: bool = False,
+        cell_grid: int = C.CELL_GRID,
     ):
         super().__init__()
         self.state_dim = int(state_dim)
@@ -69,6 +78,8 @@ class VLACVAE(nn.Module):
         self.goal_head_enabled = bool(goal_head)
         self.use_resistance = bool(use_resistance)
         self.resistance_dropout = float(resistance_dropout)
+        self.cell_head_enabled = bool(cell_head)
+        self.cell_grid = int(cell_grid)
 
         self.backbone = build_backbone(
             hidden_dim=hidden_dim,
@@ -110,13 +121,24 @@ class VLACVAE(nn.Module):
         self.num_non_image_tokens = self.num_fixed_src + self.max_language_tokens
         self.extra_src_pos = nn.Embedding(self.num_non_image_tokens, hidden_dim)
 
-        # Decoder queries: chunk_size trajectory queries (+1 goal query if enabled).
-        num_queries = chunk_size + (1 if self.goal_head_enabled else 0)
+        # Decoder queries: chunk_size trajectory queries (+1 goal query, +1 cell
+        # query) — each extra head gets its own dedicated query slot.
+        num_queries = (
+            chunk_size
+            + (1 if self.goal_head_enabled else 0)
+            + (1 if self.cell_head_enabled else 0)
+        )
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         self.action_head = nn.Linear(hidden_dim, action_dim)
         if self.goal_head_enabled:
             # Predicts (mu, logvar) over the contact point in action representation.
             self.goal_head = nn.Linear(hidden_dim, 2 * action_dim)
+        if self.cell_head_enabled:
+            # Auxiliary, image-grounded (Variant B). From one cell query:
+            #   * cell_select_head -> logits over the grid*grid frame regions;
+            #   * cell_goal_head   -> (mu_u, mu_v, logvar_u, logvar_v) in [0, 1].
+            self.cell_select_head = nn.Linear(hidden_dim, self.cell_grid * self.cell_grid)
+            self.cell_goal_head = nn.Linear(hidden_dim, 4)
 
     def _encode_style(
         self,
@@ -190,10 +212,13 @@ class VLACVAE(nn.Module):
         img_aux_feat: Optional[torch.Tensor] = None,
         resistance: Optional[torch.Tensor] = None,
     ):
-        """Returns (a_hat, goal_params, (mu, logvar)).
+        """Returns (a_hat, goal_params, cell_params, (mu, logvar)).
 
         ``goal_params`` is ``(goal_mu, goal_logvar)`` (each ``(B, action_dim)``) when
-        the goal head is enabled, else ``None``.
+        the goal head is enabled, else ``None``. ``cell_params`` is
+        ``(select_logits, cell_mu, cell_logvar)`` — ``select_logits`` ``(B, grid*grid)``,
+        ``cell_mu`` / ``cell_logvar`` ``(B, 2)`` for the image-space (u, v) Gaussian —
+        when the cell head is enabled, else ``None``.
         """
         B = qpos.size(0)
         device = qpos.device
@@ -261,7 +286,17 @@ class VLACVAE(nn.Module):
                 goal_mu = goal_mu * action_mask.float()
             goal_params = (goal_mu, goal_logvar)
 
-        return a_hat, goal_params, (mu, logvar)
+        cell_params = None
+        if self.cell_head_enabled:
+            cell_idx = self.chunk_size + (1 if self.goal_head_enabled else 0)
+            cell_hs = hs[cell_idx]                                   # (B, D)
+            select_logits = self.cell_select_head(cell_hs)          # (B, grid*grid)
+            cell_out = self.cell_goal_head(cell_hs)                 # (B, 4)
+            cell_mu = torch.sigmoid(cell_out[:, :2])                # (u, v) in [0, 1]
+            cell_logvar = cell_out[:, 2:].clamp(C.CELL_LOGVAR_MIN, C.CELL_LOGVAR_MAX)
+            cell_params = (select_logits, cell_mu, cell_logvar)
+
+        return a_hat, goal_params, cell_params, (mu, logvar)
 
 
 def build_vla_cvae(**kwargs) -> VLACVAE:

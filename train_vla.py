@@ -57,6 +57,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-goal-head", dest="goal_head", action="store_false",
                    help="Disable the contact-point Gaussian head entirely.")
     p.set_defaults(goal_head=C.GOAL_HEAD)
+    p.add_argument("--no-cell-head", dest="cell_head", action="store_false",
+                   help="Disable the cell-aware auxiliary heads (Variant B) even when the "
+                        "dataset carries observation.goal_pixel. They are otherwise "
+                        "auto-enabled only when that Cellpose label is present.")
+    p.set_defaults(cell_head=C.CELL_HEAD)
+    p.add_argument("--cell-goal-weight", type=float, default=C.CELL_GOAL_WEIGHT,
+                   help="Weight on the image-space contact-point Gaussian NLL (Variant B).")
+    p.add_argument("--cell-select-weight", type=float, default=C.CELL_SELECT_WEIGHT,
+                   help="Weight on the cell-selection cross-entropy (Variant B).")
     p.add_argument(
         "--cache-features", action="store_true",
         help="Precompute and memmap the frozen image-encoder features once, then train on the "
@@ -149,6 +158,8 @@ def run_epoch(policy, loader, optimizer, device, train: bool, amp: bool = False)
         task_family_id = batch["task_family_id"].to(device, non_blocking=True)
         instructions = batch["instruction"]
         resistance = batch["resistance"].to(device, non_blocking=True) if "resistance" in batch else None
+        goal_pixel = batch["goal_pixel"].to(device, non_blocking=True) if "goal_pixel" in batch else None
+        target_region = batch["target_region"].to(device, non_blocking=True) if "target_region" in batch else None
 
         # Either raw frames (decode path) or cached frozen-encoder features.
         if "primary_feat" in batch:
@@ -178,6 +189,8 @@ def run_epoch(policy, loader, optimizer, device, train: bool, amp: bool = False)
                 is_pad=is_pad,
                 goal=goal,
                 resistance=resistance,
+                goal_pixel=goal_pixel,
+                target_region=target_region,
                 img_primary_feat=img_primary_feat,
                 img_aux_feat=img_aux_feat,
             )
@@ -220,6 +233,9 @@ def save_vla_checkpoint(path: Path, policy, optimizer, epoch: int, best_val: flo
                 "goal_head": bool(args.goal_head),
                 "goal_weight": float(args.goal_weight),
                 "use_resistance": bool(policy.use_resistance),
+                "cell_head": bool(policy.use_cell_head),
+                "cell_goal_weight": float(args.cell_goal_weight),
+                "cell_select_weight": float(args.cell_select_weight),
                 "freeze_mode": args.freeze_mode,
                 "lora_r": int(args.lora_r),
                 "lora_alpha": float(args.lora_alpha),
@@ -231,7 +247,7 @@ def save_vla_checkpoint(path: Path, policy, optimizer, epoch: int, best_val: flo
     )
 
 
-def _build_policy(stats, vocabs, args, use_resistance):
+def _build_policy(stats, vocabs, args, use_resistance, use_cell_head):
     return build_vla_policy(
         stats=stats,
         vocabs=vocabs,
@@ -245,6 +261,9 @@ def _build_policy(stats, vocabs, args, use_resistance):
         goal_head=bool(args.goal_head),
         chunk_size=int(args.chunk_size),
         use_resistance=use_resistance,
+        cell_head=use_cell_head,
+        cell_goal_weight=args.cell_goal_weight,
+        cell_select_weight=args.cell_select_weight,
     )
 
 
@@ -263,7 +282,7 @@ def main() -> None:
     if args.resume is not None and args.resume.exists():
         resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         rcfg0 = resume_ckpt.get("config", {})
-        for attr in ("action_space", "chunk_size", "backbone", "goal_head"):
+        for attr in ("action_space", "chunk_size", "backbone", "goal_head", "cell_head"):
             if attr in rcfg0:
                 setattr(args, attr, rcfg0[attr])
         if rcfg0.get("dataset_repo_id"):
@@ -271,7 +290,7 @@ def main() -> None:
     elif args.finetune is not None and args.finetune.exists():
         # Match the pretrained chunk size / action space so weights line up.
         fcfg = torch.load(args.finetune, map_location="cpu", weights_only=False).get("config", {})
-        for attr in ("action_space", "chunk_size", "goal_head"):
+        for attr in ("action_space", "chunk_size", "goal_head", "cell_head"):
             if attr in fcfg:
                 setattr(args, attr, fcfg[attr])
 
@@ -286,7 +305,8 @@ def main() -> None:
     )
     print(f"loaded LeRobot dataset {args.dataset_repo_id} "
           f"(robot_id={full_ds.episodes[0].robot_id!r}, action_space={args.action_space}, "
-          f"chunk_size={args.chunk_size}, resistance={full_ds.has_resistance})")
+          f"chunk_size={args.chunk_size}, resistance={full_ds.has_resistance}, "
+          f"cell_labels={full_ds.has_cells})")
 
     train_ds, val_ds, train_eps, val_eps = _episode_split(full_ds, args)
     val_names = [full_ds.episodes[i].episode_id for i in sorted(val_eps)]
@@ -316,7 +336,8 @@ def main() -> None:
         full_ds.vocabs = VocabBundle(**resume_ckpt["vocabs"])
         full_ds.stats = resume_ckpt["stats"]
         use_resistance = bool(rcfg.get("use_resistance", full_ds.has_resistance))
-        policy = _build_policy(full_ds.stats, full_ds.vocabs, args, use_resistance).to(device)
+        use_cell_head = bool(rcfg.get("cell_head", full_ds.has_cells))
+        policy = _build_policy(full_ds.stats, full_ds.vocabs, args, use_resistance, use_cell_head).to(device)
         if args.freeze_mode != "none":
             apply_freeze_mode(policy, args.freeze_mode)
         if int(args.lora_r) > 0:
@@ -335,9 +356,10 @@ def main() -> None:
         merged = merge_stats(pre["stats"], full_ds.stats)
         full_ds.vocabs = ext_vocabs
         full_ds.stats = merged
-        # Keep resistance support if either the pretrained model or the new data has it.
+        # Keep resistance / cell-head support if either the pretrained model or the new data has it.
         use_resistance = bool(pre_cfg.get("use_resistance", False) or full_ds.has_resistance)
-        policy = _build_policy(merged, ext_vocabs, args, use_resistance).to(device)
+        use_cell_head = bool(args.cell_head) and (bool(pre_cfg.get("cell_head", False)) or full_ds.has_cells)
+        policy = _build_policy(merged, ext_vocabs, args, use_resistance, use_cell_head).to(device)
         load_finetune_state_dict(policy, pre["policy"], skip_patterns=("_table",))
         fill_robot_stats(policy, ext_vocabs, merged)
         if args.freeze_mode != "none":
@@ -351,10 +373,12 @@ def main() -> None:
         print(f"[finetune] loaded {args.finetune}; new robots in this dataset: {new_robots}")
     else:
         use_resistance = full_ds.has_resistance
-        policy = _build_policy(full_ds.stats, full_ds.vocabs, args, use_resistance).to(device)
+        use_cell_head = bool(args.cell_head) and full_ds.has_cells
+        policy = _build_policy(full_ds.stats, full_ds.vocabs, args, use_resistance, use_cell_head).to(device)
     print(
         f"backbone: {args.backbone}  language={args.language_backend}:{args.text_model}  "
         f"goal_head={args.goal_head}  resistance={policy.use_resistance}  "
+        f"cell_head={policy.use_cell_head}  "
         f"freeze={args.freeze_mode}  lora_r={args.lora_r}  {parameter_summary(policy)}"
     )
 

@@ -6,6 +6,9 @@ Adds, around ``VLACVAE``:
   * a **contact-point** Gaussian negative-log-likelihood on the predicted goal,
   * the CVAE KL term,
   * optional resistance conditioning,
+  * optional **cell-aware** auxiliary losses (Variant B): cross-entropy on the
+    cell-selection head + an image-space contact-point Gaussian NLL, active only
+    when the dataset carries the Cellpose-generated ``goal_pixel`` label,
   * raw-unit ``inference()`` that returns ABSOLUTE targets regardless of the
     train-time action space.
 """
@@ -46,12 +49,17 @@ class VLAPolicy(nn.Module):
         goal_weight: float = C.GOAL_LOSS_WEIGHT,
         action_space: str = C.DEFAULT_ACTION_SPACE,
         use_resistance: Optional[bool] = None,
+        cell_head: Optional[bool] = None,
+        cell_goal_weight: float = C.CELL_GOAL_WEIGHT,
+        cell_select_weight: float = C.CELL_SELECT_WEIGHT,
         **vla_kwargs,
     ):
         super().__init__()
         self.vocabs = _coerce_vocabs(vocabs)
         self.kl_weight = float(kl_weight)
         self.goal_weight = float(goal_weight)
+        self.cell_goal_weight = float(cell_goal_weight)
+        self.cell_select_weight = float(cell_select_weight)
         # "delta": predictions are relative to the base state and added back at
         # inference so .inference() always returns ABSOLUTE targets (robot-native).
         # "absolute": predictions are absolute targets directly.
@@ -62,13 +70,22 @@ class VLAPolicy(nn.Module):
             use_resistance = bool(stats.get("has_resistance", False))
         self.use_resistance = bool(use_resistance)
 
+        # Auto-detect cell-aware head support (Variant B) from the stats too.
+        if cell_head is None:
+            cell_head = bool(stats.get("has_cells", False))
+        self.use_cell_head = bool(cell_head)
+
         n_robots = len(self.vocabs.robot_ids)
         vla_kwargs.setdefault("num_robot_ids", n_robots)
         vla_kwargs.setdefault("num_lab_ids", len(self.vocabs.lab_ids))
         vla_kwargs.setdefault("num_embodiment_ids", len(self.vocabs.embodiment_ids))
         vla_kwargs.setdefault("num_action_type_ids", len(self.vocabs.action_type_ids))
         vla_kwargs.setdefault("num_task_family_ids", len(self.vocabs.task_family_ids))
-        self.model = VLACVAE(use_resistance=self.use_resistance, **vla_kwargs)
+        self.model = VLACVAE(
+            use_resistance=self.use_resistance,
+            cell_head=self.use_cell_head,
+            **vla_kwargs,
+        )
 
         # Per-robot normalization tables.
         self.register_buffer("qpos_mean_table", torch.zeros(n_robots, C.MAX_STATE_DIM))
@@ -115,10 +132,12 @@ class VLAPolicy(nn.Module):
         is_pad: Optional[torch.Tensor] = None,
         goal: Optional[torch.Tensor] = None,
         resistance: Optional[torch.Tensor] = None,
+        goal_pixel: Optional[torch.Tensor] = None,
+        target_region: Optional[torch.Tensor] = None,
         img_primary_feat: Optional[torch.Tensor] = None,
         img_aux_feat: Optional[torch.Tensor] = None,
     ):
-        a_hat, goal_params, (mu, logvar) = self.model(
+        a_hat, goal_params, cell_params, (mu, logvar) = self.model(
             image,
             qpos,
             instructions,
@@ -140,7 +159,8 @@ class VLAPolicy(nn.Module):
                 raise ValueError("action_mask and is_pad are required for training")
             axis_w = self.action_weight_table[robot_id]            # (B, MAX_ACTION_DIM)
             return self._compute_loss(
-                a_hat, actions, is_pad, action_mask, axis_w, goal, goal_params, mu, logvar
+                a_hat, actions, is_pad, action_mask, axis_w, goal, goal_params, mu, logvar,
+                cell_params=cell_params, cell_goal=goal_pixel, cell_region=target_region,
             )
         return a_hat
 
@@ -155,6 +175,9 @@ class VLAPolicy(nn.Module):
         goal_params,
         mu: torch.Tensor,
         logvar: torch.Tensor,
+        cell_params=None,
+        cell_goal: Optional[torch.Tensor] = None,
+        cell_region: Optional[torch.Tensor] = None,
     ) -> dict:
         # Per-axis-weighted, masked L1 over the action chunk.
         l1_unreduced = F.l1_loss(a_hat, actions, reduction="none")     # (B, k, A)
@@ -176,6 +199,21 @@ class VLAPolicy(nn.Module):
             goal_loss = (nll * gmask).sum() / gmask.sum().clamp_min(1.0)
             total = total + self.goal_weight * goal_loss
             out["goal"] = goal_loss.detach()
+
+        # Cell-aware auxiliary heads (Variant B): selection cross-entropy +
+        # image-space contact-point Gaussian NLL. Both shape the image features;
+        # neither feeds the action head.
+        if cell_params is not None and cell_goal is not None and cell_region is not None:
+            select_logits, cell_mu, cell_logvar = cell_params
+            cvar = cell_logvar.exp()
+            cell_nll = 0.5 * ((cell_goal - cell_mu).pow(2) / cvar + cell_logvar)  # (B, 2)
+            cell_goal_loss = cell_nll.mean()
+            cell_select_loss = F.cross_entropy(select_logits, cell_region)
+            total = (total
+                     + self.cell_goal_weight * cell_goal_loss
+                     + self.cell_select_weight * cell_select_loss)
+            out["cell_goal"] = cell_goal_loss.detach()
+            out["cell_sel"] = cell_select_loss.detach()
 
         out["loss"] = total
         return out
@@ -261,6 +299,9 @@ def build_vla_policy(
     goal_weight: float = C.GOAL_LOSS_WEIGHT,
     action_space: str = C.DEFAULT_ACTION_SPACE,
     use_resistance: Optional[bool] = None,
+    cell_head: Optional[bool] = None,
+    cell_goal_weight: float = C.CELL_GOAL_WEIGHT,
+    cell_select_weight: float = C.CELL_SELECT_WEIGHT,
     **vla_kwargs,
 ) -> VLAPolicy:
     if stats is None or vocabs is None:
@@ -275,5 +316,8 @@ def build_vla_policy(
         goal_weight=goal_weight,
         action_space=action_space,
         use_resistance=use_resistance,
+        cell_head=cell_head,
+        cell_goal_weight=cell_goal_weight,
+        cell_select_weight=cell_select_weight,
         **vla_kwargs,
     )

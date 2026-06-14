@@ -17,6 +17,10 @@ Each sample also carries:
   the policy's contact-point Gaussian head.
 * ``resistance``  — per-frame pipette resistance, ONLY when the dataset provides
   ``observation.resistance``. Auto-detected; absent datasets train without it.
+* ``goal_pixel`` / ``target_region`` — the episode's contact point in normalized
+  image pixels (u, v) and its grid-region index, ONLY when the dataset provides
+  ``observation.goal_pixel`` (the Cellpose "teacher" label; Variant B). Auto-
+  detected; absent datasets train without the cell-aware heads.
 
 Per-axis action weights (down-weighting near-constant axes) are computed from the
 realized action representation and stored in the per-robot stats.
@@ -34,6 +38,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from config import vla_config as C
+from data.cell_grid import pixel_to_region_index
 from data.vocab import VocabBundle
 
 _IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -90,6 +95,7 @@ def compute_lerobot_norm_stats(
     chunk_size: int,
     robot_id: str,
     resistance_all: Optional[np.ndarray] = None,   # (N,) or None
+    has_cells: bool = False,
 ) -> dict:
     """Per-robot stats padded to MAX_*_DIM, in the chosen action space."""
     state_dim = states_all.shape[1]
@@ -155,6 +161,7 @@ def compute_lerobot_norm_stats(
         "image_std": _IMAGENET_STD.copy(),
         "action_space": action_space,
         "has_resistance": has_resistance,
+        "has_cells": bool(has_cells),
     }
 
 
@@ -174,12 +181,15 @@ class LeRobotVLADataset(Dataset):
         image_hw: tuple = (C.IMAGE_HEIGHT, C.IMAGE_WIDTH),
         camera_key: str = C.LEROBOT_CAMERA_KEY,
         resistance_all: Optional[np.ndarray] = None,
+        goal_pixel_all: Optional[np.ndarray] = None,
     ):
         self.ds = lerobot_ds
         self.states_all = states_all
         self.actions_all = actions_all
         self.resistance_all = resistance_all
         self.has_resistance = resistance_all is not None
+        self.goal_pixel_all = goal_pixel_all
+        self.has_cells = goal_pixel_all is not None
         self.episodes = episodes
         self.stats = stats
         self.vocabs = vocabs
@@ -299,6 +309,14 @@ class LeRobotVLADataset(Dataset):
             r = float(self.resistance_all[g])
             r = (r - robot_stats["resistance_mean"]) / robot_stats["resistance_std"]
             sample["resistance"] = torch.tensor([r], dtype=torch.float32)
+        if self.has_cells:
+            # Per-episode contact point in normalized pixels (u, v), already [0, 1].
+            gp = np.asarray(self.goal_pixel_all[g], dtype=np.float32).reshape(2)
+            gp = np.clip(gp, 0.0, 1.0)
+            sample["goal_pixel"] = torch.from_numpy(gp)             # (2,)
+            sample["target_region"] = torch.tensor(
+                pixel_to_region_index(gp[0], gp[1]), dtype=torch.long
+            )
         if self.feature_cache is not None:
             # Cached raw encoder features → no video decode this step.
             primary_feat, aux_feat = self.feature_cache.get(g)
@@ -328,6 +346,8 @@ def build_lerobot_vla_dataset(
     conditioning signal. ``robot_id`` defaults to the dataset's ``robot_type`` and
     must match the rollout adapter's ``robot_id`` so per-robot stats line up.
     A per-frame ``observation.resistance`` feature is used automatically if present.
+    A per-frame ``observation.goal_pixel`` feature (the Cellpose teacher's contact
+    point; Variant B) is likewise used automatically when present.
     """
     from lerobot.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
 
@@ -346,6 +366,12 @@ def build_lerobot_vla_dataset(
         resistance_all = np.asarray(
             ds.hf_dataset[C.LEROBOT_RESISTANCE_KEY], dtype=np.float32
         ).reshape(-1)
+
+    goal_pixel_all = None
+    if C.LEROBOT_GOAL_PIXEL_KEY in ds.hf_dataset.column_names:
+        goal_pixel_all = np.asarray(
+            ds.hf_dataset[C.LEROBOT_GOAL_PIXEL_KEY], dtype=np.float32
+        ).reshape(-1, 2)
 
     episodes: List[LeRobotEpisodeMeta] = []
     for row in ds.meta.episodes:
@@ -377,6 +403,7 @@ def build_lerobot_vla_dataset(
     stats = compute_lerobot_norm_stats(
         states_all, actions_all, episodes, action_space, chunk_size, robot_id,
         resistance_all=resistance_all,
+        has_cells=goal_pixel_all is not None,
     )
     return LeRobotVLADataset(
         lerobot_ds=ds,
@@ -388,4 +415,5 @@ def build_lerobot_vla_dataset(
         action_space=action_space,
         chunk_size=chunk_size,
         resistance_all=resistance_all,
+        goal_pixel_all=goal_pixel_all,
     )

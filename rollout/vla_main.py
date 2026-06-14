@@ -139,6 +139,7 @@ def load_policy(args):
         chunk_size=int(ckpt_config.get("chunk_size", C.CHUNK_SIZE)),
         goal_head=bool(ckpt_config.get("goal_head", C.GOAL_HEAD)),
         use_resistance=bool(ckpt_config.get("use_resistance", False)),
+        cell_head=bool(ckpt_config.get("cell_head", False)),
     ).to(device)
     policy.load_state_dict(ckpt["policy"])
     policy.eval()

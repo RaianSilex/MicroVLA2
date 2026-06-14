@@ -82,6 +82,8 @@ def merge_stats(old_stats: dict, new_stats: dict) -> dict:
         "image_std": new_stats["image_std"],
         "has_resistance": bool(old_stats.get("has_resistance", False)
                                or new_stats.get("has_resistance", False)),
+        "has_cells": bool(old_stats.get("has_cells", False)
+                          or new_stats.get("has_cells", False)),
     }
 
 

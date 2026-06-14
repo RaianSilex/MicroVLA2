@@ -29,6 +29,8 @@ Produces standard LeRobot features so any LeRobot/SmolVLA tooling reads it:
 - `task` — the per-trial instruction
 - `observation.resistance` — **only if** the logs carry real `resistance_mohm`
   values (auto-detected; `--no-resistance` to skip)
+- `observation.goal_pixel` — **only if** a `cell_labels.csv` exists (Variant B;
+  auto-detected; `--no-cells` to skip). See *Cell labels* below.
 
 ### Grounded, varied instructions
 
@@ -48,6 +50,25 @@ converts them to **deltas** relative to the current state
 (`train_vla.py --action-space delta`, the default); `VLAPolicy.inference` converts
 the predicted delta back to absolute, so the robot side never changes. Use
 `--action-space absolute` to train on raw targets.
+
+## Cell labels (Variant B — Cellpose as a teacher)
+
+Optional. Generates a per-trial contact point so the policy can learn the
+cell-aware selection + image-space contact-point heads. Cellpose runs **offline
+only**; the trained policy never runs it.
+
+```bash
+# Needs `pip install 'cellpose>=4.0'`. Segments each trial's contact (last) frame,
+# picks the detected cell nearest the labeled region -> dataset/cell_labels.csv.
+python dataset_vla/generate_cell_labels.py            # --limit-trials 3 for a subset
+
+# The converter then auto-adds observation.goal_pixel (disable with --no-cells):
+python dataset_vla/convert_microact_to_lerobot.py
+```
+
+`cell_labels.csv` columns: `trial_id, goal_u, goal_v` (normalized pixels in
+`[0, 1]`; `region`/`n_cells` are written for inspection). You can also hand-edit
+or hand-author this file — the converter only needs `trial_id, goal_u, goal_v`.
 
 ## v2.1 (OpenPI / π0 / π0.5)
 

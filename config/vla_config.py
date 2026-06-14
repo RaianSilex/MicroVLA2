@@ -100,6 +100,11 @@ LEROBOT_ACTION_KEY = "action"
 # Optional: per-frame pipette resistance, written by the converter only when the
 # raw logs contain real resistance values. The loader auto-detects it.
 LEROBOT_RESISTANCE_KEY = "observation.resistance"
+# Optional (Variant B): per-episode contact point in NORMALIZED image pixels
+# (u, v) in [0, 1], generated offline by Cellpose (the "teacher") and written by
+# the converter only when a cell-labels file is present. The loader auto-detects
+# it. This grounds the cell-aware selection + image-space contact-point heads.
+LEROBOT_GOAL_PIXEL_KEY = "observation.goal_pixel"
 
 # ---------- Metadata vocab fallbacks ----------
 # Real ids are built from dataset metadata and saved into VLA checkpoints.
@@ -135,6 +140,24 @@ GOAL_LOGVAR_MAX = 4.0
 AXIS_WEIGHTING = True
 AXIS_WEIGHT_MIN = 0.05     # floor so a dim is never fully ignored
 AXIS_WEIGHT_MAX = 3.0      # cap so no single dim dominates
+
+# ---------- Cell-aware contact head (Variant B: Cellpose as a teacher) ----------
+# Cellpose is run OFFLINE (training-time only) to produce a per-episode contact
+# point in image pixels (see dataset_vla/generate_cell_labels.py). When that
+# label is present the policy learns two AUXILIARY heads from the (ResNet/DINOv2)
+# image features — so inference stays backbone-only, with no Cellpose in the loop:
+#   * a cell-SELECTION head: which CELL_GRID x CELL_GRID frame region holds the
+#     target cell (cross-entropy) — the "which cell" of technique 2;
+#   * an image-space contact-point GAUSSIAN head: a diagonal Gaussian over the
+#     target cell's (u, v) in [0, 1] (Gaussian NLL) — the "where on it".
+# These shape the image representation to be cell-aware; they do not change the
+# action head, so the same checkpoint runs unchanged when no cell labels exist.
+CELL_HEAD = True               # auto-gated: only active when the data carries goal_pixel
+CELL_GRID = 3                  # frame split into CELL_GRID x CELL_GRID selection regions
+CELL_GOAL_WEIGHT = 1.0         # weight on the image-space contact-point Gaussian NLL
+CELL_SELECT_WEIGHT = 0.5       # weight on the cell-selection cross-entropy
+CELL_LOGVAR_MIN = -8.0         # clamp pixel-Gaussian log-variance (coords are in [0, 1])
+CELL_LOGVAR_MAX = 2.0
 
 # ---------- Resistance conditioning (optional) ----------
 # If the dataset carries a per-frame resistance signal, the policy conditions on
