@@ -1,12 +1,13 @@
-"""Thin ROS2 client used by the MicroACT rollout script.
+"""Thin ROS2 client used by the MicroVLA rollout script.
 
-MicroACT is trained on the 8-D Sensapex state/action vector:
-    [x1, y1, z1, d1, x2, y2, z2, d2]
+MicroVLA's state/action vector is one manipulator per 4 axes (x, y, z, d):
 
-This is intentionally different from the OpenPI rollout this was adapted from,
-which included a ninth ODrive motor dimension. This environment subscribes only
-to the camera and two Sensapex live topics, and publishes only two Sensapex
-absolute target commands.
+    1 manipulator -> [x, y, z, d]                       (/ump only)
+    2 manipulators -> [x1, y1, z1, d1, x2, y2, z2, d2]  (/ump + /ump2)
+
+``num_manipulators`` (from ``config.NUM_MANIPULATORS``) decides how many Sensapex
+live topics this node subscribes to and how many absolute target commands it
+publishes. The camera topic is always subscribed.
 """
 
 from __future__ import annotations
@@ -23,6 +24,10 @@ from PIL import Image as PILImage
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import Int32MultiArray
+
+from config import vla_config as C
+
+_AXES = C.AXES_PER_MANIPULATOR
 
 
 @dataclass
@@ -42,11 +47,14 @@ class _SensapexROSNode(Node):
     def __init__(
         self,
         *,
+        num_manipulators: int = 1,
         save_preview: bool = True,
-        preview_path: str = "microact_live.png",
+        preview_path: str = "microvla_live.png",
         preview_every_n_frames: int = 5,
     ):
-        super().__init__("microact_sensapex_bridge")
+        super().__init__("microvla_sensapex_bridge")
+        self.num_manipulators = int(num_manipulators)
+        self.dual = self.num_manipulators >= 2
 
         self.sub_img = self.create_subscription(
             CompressedImage, "/camera/image/compressed", self._on_img, 10
@@ -54,12 +62,14 @@ class _SensapexROSNode(Node):
         self.sub_ump1_live = self.create_subscription(
             Int32MultiArray, "/ump/live", self._on_ump1_live, 10
         )
-        self.sub_ump2_live = self.create_subscription(
-            Int32MultiArray, "/ump2/live", self._on_ump2_live, 10
-        )
-
         self.pub_ump1_target = self.create_publisher(Int32MultiArray, "/ump/target", 10)
-        self.pub_ump2_target = self.create_publisher(Int32MultiArray, "/ump2/target", 10)
+        self.sub_ump2_live = None
+        self.pub_ump2_target = None
+        if self.dual:
+            self.sub_ump2_live = self.create_subscription(
+                Int32MultiArray, "/ump2/live", self._on_ump2_live, 10
+            )
+            self.pub_ump2_target = self.create_publisher(Int32MultiArray, "/ump2/target", 10)
 
         self._lock = threading.Lock()
         self._latest_image_rgb = None
@@ -86,8 +96,7 @@ class _SensapexROSNode(Node):
             if self._frame_counter % self._preview_every_n_frames == 0:
                 try:
                     # Write to a temp file then atomically replace, so a reader
-                    # (or a killed process) never sees a half-written PNG. Keep
-                    # the real extension so PIL can infer the format.
+                    # (or a killed process) never sees a half-written PNG.
                     root, ext = os.path.splitext(self._preview_path)
                     tmp_path = f"{root}.tmp{ext}"
                     PILImage.fromarray(rgb).save(tmp_path)
@@ -96,16 +105,16 @@ class _SensapexROSNode(Node):
                     self.get_logger().warn(f"Preview save failed: {e}")
 
     def _on_ump1_live(self, msg: Int32MultiArray) -> None:
-        if len(msg.data) < 4:
+        if len(msg.data) < _AXES:
             return
         with self._lock:
-            self._latest_ump1 = [int(v) for v in msg.data[:4]]
+            self._latest_ump1 = [int(v) for v in msg.data[:_AXES]]
 
     def _on_ump2_live(self, msg: Int32MultiArray) -> None:
-        if len(msg.data) < 4:
+        if len(msg.data) < _AXES:
             return
         with self._lock:
-            self._latest_ump2 = [int(v) for v in msg.data[:4]]
+            self._latest_ump2 = [int(v) for v in msg.data[:_AXES]]
 
     def get_latest(self):
         with self._lock:
@@ -114,25 +123,16 @@ class _SensapexROSNode(Node):
             ump2 = None if self._latest_ump2 is None else list(self._latest_ump2)
         return img, ump1, ump2
 
-    def send_action_absolute(
-        self,
-        x1,
-        y1,
-        z1,
-        d1,
-        x2,
-        y2,
-        z2,
-        d2,
-        speed=100,
-    ) -> None:
+    def send_action_absolute(self, values, speed: int = 100) -> None:
+        """Publish absolute targets. ``values`` is a flat [x,y,z,d(,x2,..,d2)]."""
+        values = [int(v) for v in np.asarray(values).reshape(-1)]
         ump1_msg = Int32MultiArray()
-        ump1_msg.data = [int(x1), int(y1), int(z1), int(d1), int(speed)]
+        ump1_msg.data = values[:_AXES] + [int(speed)]
         self.pub_ump1_target.publish(ump1_msg)
-
-        ump2_msg = Int32MultiArray()
-        ump2_msg.data = [int(x2), int(y2), int(z2), int(d2), int(speed)]
-        self.pub_ump2_target.publish(ump2_msg)
+        if self.dual and self.pub_ump2_target is not None:
+            ump2_msg = Int32MultiArray()
+            ump2_msg.data = values[_AXES:2 * _AXES] + [int(speed)]
+            self.pub_ump2_target.publish(ump2_msg)
 
 
 class SensapexEnv:
@@ -141,16 +141,20 @@ class SensapexEnv:
     def __init__(
         self,
         *,
+        num_manipulators: int = 1,
         save_preview: bool = True,
-        preview_path: str = "microact_live.png",
+        preview_path: str = "microvla_live.png",
         preview_every_n_frames: int = 5,
         default_speed: int = 100,
         wait_timeout_s: float = 10.0,
     ):
+        self.num_manipulators = int(num_manipulators)
+        self.dual = self.num_manipulators >= 2
         self.default_speed = int(default_speed)
 
         rclpy.init(args=None)
         self.node = _SensapexROSNode(
+            num_manipulators=self.num_manipulators,
             save_preview=save_preview,
             preview_path=preview_path,
             preview_every_n_frames=preview_every_n_frames,
@@ -162,37 +166,35 @@ class SensapexEnv:
 
         self._wait_for_first_messages(timeout_s=wait_timeout_s)
 
+    def _have_all(self):
+        img, ump1, ump2 = self.node.get_latest()
+        ready = img is not None and ump1 is not None and (ump2 is not None or not self.dual)
+        return ready, (img, ump1, ump2)
+
     def _wait_for_first_messages(self, timeout_s: float = 10.0) -> None:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            img, ump1, ump2 = self.node.get_latest()
-            if img is not None and ump1 is not None and ump2 is not None:
+            ready, _ = self._have_all()
+            if ready:
                 return
             time.sleep(0.05)
-        raise RuntimeError(
-            "Timed out waiting for /camera/image/compressed, /ump/live, /ump2/live"
-        )
+        topics = "/camera/image/compressed, /ump/live" + (", /ump2/live" if self.dual else "")
+        raise RuntimeError(f"Timed out waiting for {topics}")
 
     def get_observation(self) -> SensapexObs:
-        img, ump1, ump2 = self.node.get_latest()
-        if img is None or ump1 is None or ump2 is None:
-            raise RuntimeError("Missing observation components (image/ump1/ump2).")
+        ready, (img, ump1, ump2) = self._have_all()
+        if not ready:
+            raise RuntimeError("Missing observation components (image/ump live).")
+        state = list(ump1) + (list(ump2) if self.dual else [])
+        return SensapexObs(image_rgb=img, state=np.array(state, dtype=np.float32))
 
-        x1, y1, z1, d1 = ump1
-        x2, y2, z2, d2 = ump2
-        state = np.array([x1, y1, z1, d1, x2, y2, z2, d2], dtype=np.float32)
-        return SensapexObs(image_rgb=img, state=state)
-
-    def step_absolute(self, action_8d: np.ndarray) -> None:
-        """Send an absolute target [x1,y1,z1,d1,x2,y2,z2,d2]."""
-        action_8d = np.asarray(action_8d).reshape(-1)
-        if action_8d.shape != (8,):
-            raise ValueError(f"Expected action shape (8,), got {action_8d.shape}")
-
-        x1, y1, z1, d1, x2, y2, z2, d2 = action_8d
-        self.node.send_action_absolute(
-            x1, y1, z1, d1, x2, y2, z2, d2, speed=self.default_speed
-        )
+    def step_absolute(self, action: np.ndarray) -> None:
+        """Send an absolute target [x,y,z,d(,x2,y2,z2,d2)]."""
+        action = np.asarray(action).reshape(-1)
+        expected = self.num_manipulators * _AXES
+        if action.shape != (expected,):
+            raise ValueError(f"Expected action shape ({expected},), got {action.shape}")
+        self.node.send_action_absolute(action, speed=self.default_speed)
 
     def close(self) -> None:
         try:
@@ -203,4 +205,3 @@ class SensapexEnv:
             rclpy.shutdown()
         except Exception:
             pass
-

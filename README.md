@@ -1,8 +1,9 @@
 # MicroVLA
 
 A compact **vision-language-action** policy for micromanipulation under a
-microscope (e.g. driving two Sensapex uMp4 pipettes toward a target cell). It is
-an ACT-style action-chunking CVAE (Zhao et al. 2023) conditioned on:
+microscope (e.g. driving a Sensapex uMp4 pipette toward a target cell; one
+manipulator by default, two with `NUM_MANIPULATORS=2`). It is an ACT-style
+action-chunking CVAE (Zhao et al. 2023) conditioned on:
 
 - one microscope frame (DINOv2 / Cellpose-SAM / ResNet18 backbones),
 - a frozen-text instruction (DistilBERT by default),
@@ -65,8 +66,11 @@ dataset/
 └── instruction_labels.csv                # trial_id, region, [instruction]
 ```
 
-CSV columns: `current_{x,y,z,d}` + `current_{x2,y2,z2,d2}` (state),
-`target_*` (absolute action), `image_path`, optional `resistance_mohm`.
+CSV columns: `current_{x,y,z,d}` (+ `current_{x2,y2,z2,d2}` for a 2nd
+manipulator) for the state, matching `target_*` for the absolute action,
+`image_path`, optional `resistance_mohm`. By default only the **first**
+manipulator (`x,y,z,d`) is converted (`NUM_MANIPULATORS=1` /
+`--manipulators 1`); the `*2` columns may be absent or simply ignored.
 `instruction_labels.csv` maps each trial to the **target cell's region** in the
 frame (`top_left … center … bottom_right`, many aliases accepted) so the language
 channel carries real signal. The converter scaffolds it (all `center`) on first
@@ -254,6 +258,7 @@ push_to_huggingface.py         upload a checkpoint or dataset folder to the Hub
 
 | Constant | Default | Notes |
 |---|---|---|
+| `NUM_MANIPULATORS` | `1` | Pipettes used (1 = `xyzd`, 2 = dual). Re-convert + re-train to change. |
 | `CHUNK_SIZE` | `30` | Actions predicted per inference (~10 s at 3 Hz). |
 | `DEFAULT_ACTION_SPACE` | `"delta"` | Train on deltas; inference returns absolute. |
 | `GOAL_HEAD` / `GOAL_LOSS_WEIGHT` | `True` / `1.0` | Contact-point Gaussian head + NLL weight. |

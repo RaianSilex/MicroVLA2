@@ -309,6 +309,12 @@ def main() -> None:
     # Lazy import so the rest of the repo doesn't require lerobot.
     from lerobot.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
 
+    # Which manipulators to convert (1 = single pipette xyzd; 2 = dual). The raw
+    # CSV may contain both; we select only the first --manipulators of them.
+    state_cols = list(C.state_cols_for(args.manipulators))
+    action_cols = list(C.action_cols_for(args.manipulators))
+    print(f"[manipulators] using {args.manipulators} -> state/action dims = {len(state_cols)}")
+
     data_root = args.data_root.expanduser().resolve()
     logs_dir = data_root / "logs" if (data_root / "logs").is_dir() else data_root
     frames_dir = data_root / "saved_frames"
@@ -338,8 +344,8 @@ def main() -> None:
     features = {
         C.LEROBOT_CAMERA_KEY: {"dtype": "image", "shape": (args.down_h, args.down_w, 3),
                                "names": ["height", "width", "channel"]},
-        C.LEROBOT_STATE_KEY: {"dtype": "float32", "shape": (len(STATE_COLS),), "names": ["state"]},
-        C.LEROBOT_ACTION_KEY: {"dtype": "float32", "shape": (len(ACTION_COLS),), "names": ["action"]},
+        C.LEROBOT_STATE_KEY: {"dtype": "float32", "shape": (len(state_cols),), "names": ["state"]},
+        C.LEROBOT_ACTION_KEY: {"dtype": "float32", "shape": (len(action_cols),), "names": ["action"]},
     }
     if has_resistance:
         features[C.LEROBOT_RESISTANCE_KEY] = {"dtype": "float32", "shape": (1,), "names": ["resistance"]}
@@ -369,7 +375,7 @@ def main() -> None:
     for csv_path in csv_files:
         trial_id = _trial_idx(csv_path)
         df = pd.read_csv(csv_path)
-        missing = [c for c in (*STATE_COLS, *ACTION_COLS) if c not in df.columns]
+        missing = [c for c in (*state_cols, *action_cols) if c not in df.columns]
         if missing:
             raise KeyError(f"{csv_path.name} missing columns: {missing}")
 
@@ -384,8 +390,8 @@ def main() -> None:
             print(f"[skip] trial_{trial_id}: no valid rows")
             continue
 
-        states = df[STATE_COLS].to_numpy(dtype=np.float32)
-        actions = df[ACTION_COLS].to_numpy(dtype=np.float32)
+        states = df[state_cols].to_numpy(dtype=np.float32)
+        actions = df[action_cols].to_numpy(dtype=np.float32)
 
         # Repair uninitialized commanded targets (target_* == 0 is a logging
         # sentinel): hold at the current state so the (absolute) action is a
@@ -474,6 +480,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--robot-type", type=str, default=C.DEFAULT_ROBOT_ID,
                    help="Stored as the dataset robot_type AND used as the robot id for "
                         "per-robot normalization. Must match the rollout adapter's robot_id.")
+    p.add_argument("--manipulators", type=int, default=C.NUM_MANIPULATORS, choices=(1, 2),
+                   help="How many manipulators to convert from the raw CSV. 1 = single "
+                        "pipette (xyzd, 4-dim); 2 = dual (8-dim). Default from config "
+                        f"(NUM_MANIPULATORS={C.NUM_MANIPULATORS}).")
     p.add_argument("--fps", type=int, default=3)
     p.add_argument("--down-h", type=int, default=540)
     p.add_argument("--down-w", type=int, default=720)
