@@ -25,16 +25,38 @@ VLA_CKPT_DIR = REPO_ROOT / "checkpoints_vla"
 VLA_STATS_PATH = VLA_CKPT_DIR / "vla_stats.pkl"
 
 # ---------- Raw CSV layout (converters only) ----------
-# State  = [x1, y1, z1, d1, x2, y2, z2, d2]   (centered Sensapex counts)
-# Action = absolute target in the same 8-dim space.
-CSV_STATE_COLS = (
-    "current_x",  "current_y",  "current_z",  "current_d",
-    "current_x2", "current_y2", "current_z2", "current_d2",
+# Each manipulator contributes AXES_PER_MANIPULATOR axes (x, y, z, d). The raw
+# logs may carry a second manipulator (x2, y2, z2, d2); NUM_MANIPULATORS chooses
+# how many THIS dataset/model uses:
+#   1 -> single pipette: state/action = [x, y, z, d]           (4-dim)
+#   2 -> dual pipette:   state/action = [x1..d1, x2..d2]       (8-dim)
+# The model is dimension-agnostic (padded to MAX_*_DIM with masks), so switching
+# is just this one number + a re-convert + a re-train. Nothing is hard-coded to 8.
+AXES_PER_MANIPULATOR = 4
+NUM_MANIPULATORS = 1
+
+_STATE_COLS_BY_MANIPULATOR = (
+    ("current_x",  "current_y",  "current_z",  "current_d"),
+    ("current_x2", "current_y2", "current_z2", "current_d2"),
 )
-CSV_ACTION_COLS = (
-    "target_x",  "target_y",  "target_z",  "target_d",
-    "target_x2", "target_y2", "target_z2", "target_d2",
+_ACTION_COLS_BY_MANIPULATOR = (
+    ("target_x",  "target_y",  "target_z",  "target_d"),
+    ("target_x2", "target_y2", "target_z2", "target_d2"),
 )
+
+
+def state_cols_for(n_manipulators: int) -> tuple:
+    """Flat raw state-column names for the first ``n_manipulators`` manipulators."""
+    return tuple(c for g in _STATE_COLS_BY_MANIPULATOR[:int(n_manipulators)] for c in g)
+
+
+def action_cols_for(n_manipulators: int) -> tuple:
+    """Flat raw action-column names for the first ``n_manipulators`` manipulators."""
+    return tuple(c for g in _ACTION_COLS_BY_MANIPULATOR[:int(n_manipulators)] for c in g)
+
+
+CSV_STATE_COLS = state_cols_for(NUM_MANIPULATORS)
+CSV_ACTION_COLS = action_cols_for(NUM_MANIPULATORS)
 CSV_IMAGE_COL = "image_path"
 CSV_TIMESTEP_COL = "timestep"
 # Optional per-timestep pipette resistance (megaohms). Used automatically if the

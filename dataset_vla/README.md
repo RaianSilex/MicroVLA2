@@ -24,8 +24,10 @@ python dataset_vla/convert_microact_to_lerobot.py --push-to-hub      # upload (n
 Produces standard LeRobot features so any LeRobot/SmolVLA tooling reads it:
 
 - `observation.images.cam_main` — frame (letterboxed to 540×720 by default)
-- `observation.state` — 8-D absolute Sensapex state
-- `action` — 8-D **absolute** Sensapex target (robot-native)
+- `observation.state` — absolute Sensapex state (4-D `[x,y,z,d]` for one
+  manipulator by default; 8-D for two — set `NUM_MANIPULATORS` or pass
+  `--manipulators 2`)
+- `action` — **absolute** Sensapex target, same dims as the state (robot-native)
 - `task` — the per-trial instruction
 - `observation.resistance` — **only if** the logs carry real `resistance_mohm`
   values (auto-detected; `--no-resistance` to skip)
