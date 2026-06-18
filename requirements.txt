@@ -1,14 +1,23 @@
-torch>=2.0
-torchvision>=0.15
+# Upper bounds are capped at the next major so pip's resolver stops backtracking
+# (downloading many candidate versions) on the loose lower bounds. The numpy cap
+# is the important one: lerobot>=0.4 needs numpy 2.x, so pinning <3 stops the slow
+# numpy 1.x<->2.x flip-flop. On a GPU node install the CUDA torch wheel FIRST so
+# pip never re-resolves torch:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r requirements.txt
+# For a fully deterministic, fast install use uv:  uv pip install -r requirements.txt
+# To freeze an exact lock from a working env:      pip freeze > requirements-lock.txt
+torch>=2.2,<3
+torchvision>=0.17,<1
 # numpy 2.x is required by lerobot>=0.4; MicroVLA is numpy-2 compatible.
-numpy>=1.24
-pandas>=2.0
-pillow>=10.0
+numpy>=2.0,<3
+pandas>=2.0,<3
+pillow>=10.0,<12
 # Frozen text encoder for the language channel (DistilBERT by default).
-transformers>=4.40
+transformers>=4.40,<5
 # LeRobot dataset path (SmolVLA / OpenPI / pi0 style). Pulls in huggingface_hub
 # + datasets. Required to convert/train/rollout from a LeRobot dataset.
-lerobot>=0.4
-# Optional — only needed for backbones that include "cellpose" / "cellpose4".
-# Cellpose 4 provides the Cellpose-SAM (`cpsam`) transformer used by `cellpose4`.
-cellpose>=4.0
+lerobot>=0.4,<0.6
+# Optional — only needed for backbones that include "cellpose" / "cellpose4"
+# (and the Variant B label generator). Skip it for the resnet18 backbone.
+cellpose>=4.0,<5
