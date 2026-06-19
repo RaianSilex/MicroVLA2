@@ -46,7 +46,7 @@ CSV_IMAGE_COL = "image_path"
 CSV_TIMESTEP_COL = "timestep"
 
 # ---------- ACT model hyperparameters ----------
-CHUNK_SIZE = 100         # k: number of future actions predicted per inference
+CHUNK_SIZE = 30          # k: number of future actions predicted per inference
 HIDDEN_DIM = 512
 DIM_FEEDFORWARD = 3200
 ENC_LAYERS = 4
