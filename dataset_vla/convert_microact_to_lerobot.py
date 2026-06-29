@@ -108,26 +108,60 @@ _REGION_ALIASES = {
 # Every region spelling the labels CSV may use.
 ACCEPTED_REGIONS = sorted(set(REGIONS) | set(_REGION_ALIASES))
 
-# Instruction phrasing depends on how many manipulators the dataset uses, so a
-# single-uMp dataset doesn't get "both manipulators" / "the two pipettes" prompts.
-_TEMPLATES_SINGLE = [
-    "move the manipulator toward the {r} cell",
-    "guide the pipette to the cell in the {r}",
-    "advance the needle to the {r} cell",
-    "target the {r} cell with the manipulator",
-    "bring the pipette to the {r} cell",
-]
-_TEMPLATES_DUAL = [
-    "move both manipulators toward the {r} cell",
-    "guide the pipettes to the cell in the {r}",
-    "advance both needles to the {r} cell",
-    "target the {r} cell with both manipulators",
-    "bring the two pipettes to the {r} cell",
-]
+# ---------------------------------------------------------------------------
+# Task types. The instruction string is the ONLY task signal the policy gets, so
+# giving each task a distinct phrasing lets ONE model perform multiple tasks
+# selected by the prompt at inference (e.g. "move ... toward" -> targeting motion;
+# "record ... from" -> patch-clamp motion). Each task has singular (1 uMp) and
+# dual (2 uMp) phrasings. Add a new task here (+ its raw trials via --source) to
+# extend the model to more skills.
+# ---------------------------------------------------------------------------
+_TARGETING_TEMPLATES = {
+    1: [
+        "move the manipulator toward the {r} cell",
+        "guide the pipette to the cell in the {r}",
+        "advance the needle to the {r} cell",
+        "target the {r} cell with the manipulator",
+        "bring the pipette to the {r} cell",
+    ],
+    2: [
+        "move both manipulators toward the {r} cell",
+        "guide the pipettes to the cell in the {r}",
+        "advance both needles to the {r} cell",
+        "target the {r} cell with both manipulators",
+        "bring the two pipettes to the {r} cell",
+    ],
+}
+_PATCH_CLAMP_TEMPLATES = {
+    1: [
+        "record signal from the {r} cell",
+        "patch-clamp the {r} cell",
+        "record from the cell in the {r}",
+        "establish a seal on the {r} cell",
+        "obtain a recording from the {r} cell",
+    ],
+    2: [
+        "record signals from the {r} cell with both pipettes",
+        "patch-clamp the {r} cell with both manipulators",
+        "record from the cell in the {r} using both pipettes",
+        "establish seals on the {r} cell with both needles",
+        "obtain recordings from the {r} cell with both pipettes",
+    ],
+}
+
+# task name -> {1: [...single-uMp templates...], 2: [...dual-uMp templates...]}
+TASK_TEMPLATES = {
+    "targeting": _TARGETING_TEMPLATES,
+    "patch_clamp": _PATCH_CLAMP_TEMPLATES,
+}
+DEFAULT_TASK = "targeting"
 
 
-def _templates_for(n_manipulators: int) -> list:
-    return _TEMPLATES_DUAL if int(n_manipulators) >= 2 else _TEMPLATES_SINGLE
+def _templates_for(task: str, n_manipulators: int) -> list:
+    if task not in TASK_TEMPLATES:
+        raise ValueError(f"unknown task {task!r}; known tasks: {sorted(TASK_TEMPLATES)}")
+    variants = TASK_TEMPLATES[task]
+    return variants[2] if int(n_manipulators) >= 2 else variants[1]
 
 
 def normalize_region(raw: str) -> tuple[str, bool]:
@@ -145,15 +179,17 @@ def normalize_region(raw: str) -> tuple[str, bool]:
     return "center", False
 
 
-def instruction_for(trial_id: int, region: str, n_manipulators: int = C.NUM_MANIPULATORS) -> str:
+def instruction_for(trial_id: int, region: str, n_manipulators: int = C.NUM_MANIPULATORS,
+                    task: str = DEFAULT_TASK) -> str:
     """Deterministic, grounded, lexically-varied instruction for a trial.
 
-    Phrasing matches the manipulator count (singular for 1, "both"/"two" for 2).
+    Phrasing matches the task (targeting / patch_clamp / ...) and the manipulator
+    count (singular for 1, "both"/"two" for 2).
     """
     canon, _ = normalize_region(region)
     phrases = _REGION_PHRASES[canon]
     phrase = phrases[trial_id % len(phrases)]
-    templates = _templates_for(n_manipulators)
+    templates = _templates_for(task, n_manipulators)
     template = templates[trial_id % len(templates)]
     return template.format(r=phrase)
 
@@ -205,7 +241,8 @@ def load_or_scaffold_labels(path: Path, trial_ids: list[int]) -> dict[int, dict]
 
 
 def resolve_instruction(
-    trial_id: int, labels: dict[int, dict], n_manipulators: int = C.NUM_MANIPULATORS
+    trial_id: int, labels: dict[int, dict], n_manipulators: int = C.NUM_MANIPULATORS,
+    task: str = DEFAULT_TASK,
 ) -> tuple[str, str]:
     """(instruction, canonical_region) for a trial, honoring a free-text override."""
     entry = labels.get(trial_id, {"region": "center", "instruction": ""})
@@ -217,7 +254,7 @@ def resolve_instruction(
     override = entry.get("instruction", "")
     if override:
         return override, canon
-    return instruction_for(trial_id, canon, n_manipulators), canon
+    return instruction_for(trial_id, canon, n_manipulators, task), canon
 
 
 # ---------------------------------------------------------------------------
@@ -288,6 +325,38 @@ def _resolve_image_path(raw: str, data_root: Path, frames_dir: Path, trial_id: i
 
 
 # ---------------------------------------------------------------------------
+# Sources (one or many raw-trial roots, each with its own task type)
+# ---------------------------------------------------------------------------
+
+def _parse_source_spec(spec: str, default_task: str) -> tuple[str, str]:
+    """Parse a --source spec 'ROOT[:TASK]' into (root, task)."""
+    if ":" in spec:
+        root, maybe_task = spec.rsplit(":", 1)
+        if maybe_task in TASK_TEMPLATES:
+            return root, maybe_task
+    return spec, default_task
+
+
+def _resolve_sources(args) -> list[dict]:
+    """Build the list of raw-trial sources to convert into ONE dataset.
+
+    Multi-task: pass --source ROOT:TASK repeatedly (regions per source come from
+    <ROOT>/instruction_labels.csv). Single-task (back-compat): --data-root + --task.
+    """
+    sources: list[dict] = []
+    if args.source:
+        for spec in args.source:
+            root, task = _parse_source_spec(spec, args.task)
+            root = Path(root).expanduser().resolve()
+            sources.append({"root": root, "task": task,
+                            "labels_path": root / "instruction_labels.csv"})
+    else:
+        sources.append({"root": args.data_root.expanduser().resolve(), "task": args.task,
+                        "labels_path": args.labels.expanduser().resolve()})
+    return sources
+
+
+# ---------------------------------------------------------------------------
 # Conversion
 # ---------------------------------------------------------------------------
 
@@ -303,18 +372,22 @@ def main() -> None:
     action_cols = list(C.action_cols_for(args.manipulators))
     print(f"[manipulators] using {args.manipulators} -> state/action dims = {len(state_cols)}")
 
-    data_root = args.data_root.expanduser().resolve()
-    logs_dir = data_root / "logs" if (data_root / "logs").is_dir() else data_root
-    frames_dir = data_root / "saved_frames"
-
-    csv_files = sorted(logs_dir.glob("trial_*.csv"), key=_trial_idx)
-    if not csv_files:
-        raise FileNotFoundError(f"No trial_*.csv under {logs_dir}")
-    if args.limit_trials and args.limit_trials > 0:
-        csv_files = csv_files[: args.limit_trials]
-    trial_ids = [_trial_idx(p) for p in csv_files]
-
-    labels = load_or_scaffold_labels(args.labels.expanduser().resolve(), trial_ids)
+    # One or many raw-trial sources (each a task type) -> one combined dataset.
+    sources = _resolve_sources(args)
+    for s in sources:
+        root = s["root"]
+        logs_dir = root / "logs" if (root / "logs").is_dir() else root
+        s["data_root"] = root
+        s["frames_dir"] = root / "saved_frames"
+        csvs = sorted(logs_dir.glob("trial_*.csv"), key=_trial_idx)
+        if not csvs:
+            raise FileNotFoundError(f"No trial_*.csv under {logs_dir}")
+        if args.limit_trials and args.limit_trials > 0:
+            csvs = csvs[: args.limit_trials]
+        s["csv_files"] = csvs
+        s["labels"] = load_or_scaffold_labels(s["labels_path"], [_trial_idx(p) for p in csvs])
+        print(f"[source] task={s['task']!r}  trials={len(csvs)}  root={root}")
+    all_csvs = [p for s in sources for p in s["csv_files"]]
 
     out_root = (Path(args.root).expanduser().resolve() / args.repo_id) if args.root else (HF_LEROBOT_HOME / args.repo_id)
     if out_root.exists():
@@ -324,8 +397,9 @@ def main() -> None:
         else:
             raise FileExistsError(f"{out_root} exists; pass --overwrite to rebuild it.")
 
-    # Optional: pipette resistance, included only if the raw logs carry real values.
-    has_resistance = args.resistance and _dataset_has_resistance(csv_files)
+    # Optional: pipette resistance, included if ANY source's logs carry real values
+    # (patch-clamp sources will; targeting sources get resistance=0).
+    has_resistance = args.resistance and _dataset_has_resistance(all_csvs)
     features = {
         C.LEROBOT_CAMERA_KEY: {"dtype": "image", "shape": (args.down_h, args.down_w, 3),
                                "names": ["height", "width", "channel"]},
@@ -349,75 +423,85 @@ def main() -> None:
     )
 
     region_counts: dict[str, int] = {}
+    task_counts: dict[str, int] = {}
     total_rows = 0
-    for csv_path in csv_files:
-        trial_id = _trial_idx(csv_path)
-        df = pd.read_csv(csv_path)
-        missing = [c for c in (*state_cols, *action_cols) if c not in df.columns]
-        if missing:
-            raise KeyError(f"{csv_path.name} missing columns: {missing}")
+    total_eps = 0
+    for s in sources:
+        task = s["task"]
+        labels = s["labels"]
+        data_root = s["data_root"]
+        frames_dir = s["frames_dir"]
+        for csv_path in s["csv_files"]:
+            trial_id = _trial_idx(csv_path)
+            df = pd.read_csv(csv_path)
+            missing = [c for c in (*state_cols, *action_cols) if c not in df.columns]
+            if missing:
+                raise KeyError(f"{csv_path.name} missing columns: {missing}")
 
-        # Drop rows without an image reference.
-        img_col = df[IMAGE_COL] if IMAGE_COL in df.columns else pd.Series([""] * len(df))
-        keep = img_col.notna() & img_col.astype(str).str.strip().ne("")
-        # If the column is absent entirely, keep all rows (fallback path resolves frames).
-        if IMAGE_COL not in df.columns:
-            keep = pd.Series([True] * len(df))
-        df = df[keep].reset_index(drop=True)
-        if len(df) == 0:
-            print(f"[skip] trial_{trial_id}: no valid rows")
-            continue
+            # Drop rows without an image reference.
+            img_col = df[IMAGE_COL] if IMAGE_COL in df.columns else pd.Series([""] * len(df))
+            keep = img_col.notna() & img_col.astype(str).str.strip().ne("")
+            # If the column is absent entirely, keep all rows (fallback resolves frames).
+            if IMAGE_COL not in df.columns:
+                keep = pd.Series([True] * len(df))
+            df = df[keep].reset_index(drop=True)
+            if len(df) == 0:
+                print(f"[skip] {task} trial_{trial_id}: no valid rows")
+                continue
 
-        states = df[state_cols].to_numpy(dtype=np.float32)
-        actions = df[action_cols].to_numpy(dtype=np.float32)
+            states = df[state_cols].to_numpy(dtype=np.float32)
+            actions = df[action_cols].to_numpy(dtype=np.float32)
 
-        # Repair uninitialized commanded targets (target_* == 0 is a logging
-        # sentinel): hold at the current state so the (absolute) action is a
-        # zero-delta hold instead of a huge bogus jump that wrecks stats.
-        if args.fix_uninitialized_targets:
-            zero = actions == 0
-            n_fixed = int(zero.any(axis=1).sum())
-            if n_fixed:
-                actions = np.where(zero, states, actions)
-                print(f"[clean] trial_{trial_id}: held {n_fixed} uninitialized-target row(s)")
+            # Repair uninitialized commanded targets (target_* == 0 is a logging
+            # sentinel): hold at the current state so the (absolute) action is a
+            # zero-delta hold instead of a huge bogus jump that wrecks stats.
+            if args.fix_uninitialized_targets:
+                zero = actions == 0
+                n_fixed = int(zero.any(axis=1).sum())
+                if n_fixed:
+                    actions = np.where(zero, states, actions)
+                    print(f"[clean] {task} trial_{trial_id}: held {n_fixed} uninitialized-target row(s)")
 
-        instruction, region = resolve_instruction(trial_id, labels, args.manipulators)
-        region_counts[region] = region_counts.get(region, 0) + 1
+            instruction, region = resolve_instruction(trial_id, labels, args.manipulators, task)
+            region_counts[region] = region_counts.get(region, 0) + 1
+            task_counts[task] = task_counts.get(task, 0) + 1
 
-        resist = _trial_resistance(df) if has_resistance else None
-        if has_resistance and resist is None:
-            resist = np.zeros(len(df), dtype=np.float32)
+            resist = _trial_resistance(df) if has_resistance else None
+            if has_resistance and resist is None:
+                resist = np.zeros(len(df), dtype=np.float32)
 
-        raw_paths = (
-            df[IMAGE_COL].astype(str).tolist() if IMAGE_COL in df.columns else [""] * len(df)
-        )
-        wrote = 0
-        for t in range(len(df)):
-            src = _resolve_image_path(raw_paths[t], data_root, frames_dir, trial_id, t)
-            if src is None:
-                raise FileNotFoundError(
-                    f"trial_{trial_id} t={t}: could not resolve image (csv={raw_paths[t]!r})"
-                )
-            img = _load_rgb_uint8(src)
-            img = (_resize_letterbox(img, *out_hw) if args.keep_aspect else _resize_exact(img, *out_hw))
-            frame = {
-                C.LEROBOT_CAMERA_KEY: img,
-                C.LEROBOT_STATE_KEY: states[t],
-                C.LEROBOT_ACTION_KEY: actions[t],
-                "task": instruction,
-            }
-            if has_resistance:
-                frame[C.LEROBOT_RESISTANCE_KEY] = np.array([resist[t]], dtype=np.float32)
-            ds.add_frame(frame)
-            wrote += 1
-        ds.save_episode()
-        total_rows += wrote
-        print(f"[OK] trial_{trial_id}: {wrote} frames | region={region} | task={instruction!r}")
+            raw_paths = (
+                df[IMAGE_COL].astype(str).tolist() if IMAGE_COL in df.columns else [""] * len(df)
+            )
+            wrote = 0
+            for t in range(len(df)):
+                src = _resolve_image_path(raw_paths[t], data_root, frames_dir, trial_id, t)
+                if src is None:
+                    raise FileNotFoundError(
+                        f"{task} trial_{trial_id} t={t}: could not resolve image (csv={raw_paths[t]!r})"
+                    )
+                img = _load_rgb_uint8(src)
+                img = (_resize_letterbox(img, *out_hw) if args.keep_aspect else _resize_exact(img, *out_hw))
+                frame = {
+                    C.LEROBOT_CAMERA_KEY: img,
+                    C.LEROBOT_STATE_KEY: states[t],
+                    C.LEROBOT_ACTION_KEY: actions[t],
+                    "task": instruction,
+                }
+                if has_resistance:
+                    frame[C.LEROBOT_RESISTANCE_KEY] = np.array([resist[t]], dtype=np.float32)
+                ds.add_frame(frame)
+                wrote += 1
+            ds.save_episode()
+            total_rows += wrote
+            total_eps += 1
+            print(f"[OK] {task} trial_{trial_id}: {wrote} frames | region={region} | task={instruction!r}")
 
     ds.finalize()
 
     print("\n=== summary ===")
-    print(f"episodes={len(csv_files)}  frames={total_rows}")
+    print(f"episodes={total_eps}  frames={total_rows}")
+    print(f"task_counts={task_counts}")
     print(f"region_counts={region_counts}")
     print(f"robot_type={args.robot_type}  fps={args.fps}  image={args.down_h}x{args.down_w}")
     print(f"local dataset: {out_root}")
@@ -442,6 +526,14 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Convert MicroACT trials to a LeRobot dataset.")
     p.add_argument("--data-root", type=Path, default=C.DATASET_ROOT)
     p.add_argument("--labels", type=Path, default=C.DATASET_ROOT / "instruction_labels.csv")
+    p.add_argument("--task", type=str, default=DEFAULT_TASK, choices=sorted(TASK_TEMPLATES),
+                   help="Task type for --data-root (selects instruction phrasing): "
+                        f"{sorted(TASK_TEMPLATES)}. Default '{DEFAULT_TASK}'.")
+    p.add_argument("--source", action="append", default=None, metavar="ROOT[:TASK]",
+                   help="Combine MULTIPLE raw-trial sources into ONE dataset (multi-task). "
+                        "Repeat per task, e.g. --source /data/oocyte:targeting "
+                        "--source /data/patch:patch_clamp. Each source's regions come from "
+                        "<ROOT>/instruction_labels.csv. Overrides --data-root/--task/--labels.")
     p.add_argument("--repo-id", type=str, default=C.DEFAULT_DATASET_REPO_ID)
     p.add_argument("--root", type=Path, default=None,
                    help="Output base dir for the LeRobot repo. Default: HF_LEROBOT_HOME.")

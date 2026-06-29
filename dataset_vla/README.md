@@ -51,6 +51,39 @@ converts them to **deltas** relative to the current state
 the predicted delta back to absolute, so the robot side never changes. Use
 `--action-space absolute` to train on raw targets.
 
+### Multi-task: one model, prompt selects the task
+
+The instruction string is the only task signal the policy gets, so distinct
+phrasings let **one** model do several tasks chosen by the prompt at inference.
+Each task has its own phrasing (`TASK_TEMPLATES` in
+`convert_microact_to_lerobot.py`): e.g. `targeting` → "move the manipulator toward
+the {region} cell"; `patch_clamp` → "record signal from the {region} cell".
+
+Build a **combined** dataset by passing multiple raw sources (one per task) into a
+single run — each `ROOT` needs its own `instruction_labels.csv`:
+
+```bash
+python dataset_vla/convert_microact_to_lerobot.py \
+  --source /data/oocyte_raw:targeting \
+  --source /data/patchclamp_raw:patch_clamp \
+  --repo-id RaianSilex/MicroVLA_combined --push-to-hub
+```
+
+A single-task dataset is just one source (or the back-compatible `--data-root`
+`--task patch_clamp`). The two task's **motion orders** (e.g. z→xy vs xy→z) come
+straight from each source's demonstrations — nothing to configure. Add a new task
+by registering its templates in `TASK_TEMPLATES` and adding a `--source`.
+
+**Resistance + mixed tasks:** if any source carries real `resistance_mohm` (patch
+clamp does), the whole dataset gets `observation.resistance`; sources without it
+(targeting) get `0`. The policy conditions on it with modality dropout, so it
+helps reactive control (contact spike) without becoming the task switch.
+
+> For the prompt to truly select the task, keep visual conditions comparable
+> across tasks (ideally some scenes demonstrated under both prompts). If targeting
+> and patch-clamp scenes look very different, the model may learn the task from the
+> image and ignore the prompt — a data-design issue, not a code one.
+
 ## v2.1 (OpenPI / π0 / π0.5)
 
 OpenPI pins an older `lerobot` and needs **v2.1**, not the v3.0 that lerobot ≥ 0.4
