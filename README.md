@@ -139,7 +139,7 @@ motion).
 # Terminal 2 (ROS sourced, repo .venv):
 python -m rollout.vla_main \
   --checkpoint checkpoints_vla/vla_policy_best.pt \
-  --instruction "move both manipulators toward the top-left cell" \
+  --instruction "move the manipulator toward the top-left cell" \
   --dry-run
 ```
 
@@ -188,8 +188,8 @@ model/
 rollout/
   vla_main.py                  closed-loop rollout entry point
   offline_replay.py            mean-collapse / goal diagnostic
-  adapters/sensapex_dual.py    dual-Sensapex adapter + safety limits
-  sensapex_env.py              ROS2 camera + 2 manipulators bridge
+  adapters/sensapex_dual.py    Sensapex adapter (1-2 manipulators) + safety limits
+  sensapex_env.py              ROS2 camera + 1-2 manipulator bridge
 dataset_vla/
   convert_microact_to_lerobot.py       raw trials -> LeRobot v3.0
   convert_microact_to_lerobot_v21.py   raw trials -> LeRobot v2.1 (OpenPI)

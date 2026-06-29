@@ -428,7 +428,7 @@ def main() -> None:
     if args.push_to_hub:
         print(f"[push] pushing to hub: {args.repo_id} (private)")
         ds.push_to_hub(
-            tags=["sensapex", "micromanipulation", "dual_ump", "microvla"],
+            tags=["sensapex", "micromanipulation", "single_ump", "microvla"],
             private=True,
             push_videos=False,
             license="apache-2.0",

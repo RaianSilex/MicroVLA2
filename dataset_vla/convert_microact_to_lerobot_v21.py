@@ -238,7 +238,7 @@ def main() -> None:
 
     if args.push_to_hub:
         print(f"[push] pushing to hub: {args.repo_id} (private)")
-        tags = ["sensapex", "micromanipulation", "dual_ump", "microvla", "lerobot-v2.1", "openpi"]
+        tags = ["sensapex", "micromanipulation", "single_ump", "microvla", "lerobot-v2.1", "openpi"]
         try:
             ds.push_to_hub(tags=tags, private=True, license="apache-2.0", push_videos=False)
         except TypeError:

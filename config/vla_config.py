@@ -126,9 +126,9 @@ LEROBOT_RESISTANCE_KEY = "observation.resistance"
 # ---------- Metadata vocab fallbacks ----------
 # Real ids are built from dataset metadata and saved into VLA checkpoints.
 UNKNOWN_TOKEN = "<unk>"
-DEFAULT_ROBOT_ID = "sensapex_dual_ump4"
+DEFAULT_ROBOT_ID = "sensapex_single_ump4"
 DEFAULT_LAB_ID = "local_lab"
-DEFAULT_EMBODIMENT = "dual_manipulator"
+DEFAULT_EMBODIMENT = "single_manipulator"
 DEFAULT_ACTION_TYPE = "absolute_position"
 DEFAULT_TASK_FAMILY = "cell_manipulation"
 

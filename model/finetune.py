@@ -43,7 +43,7 @@ def extend_vocab(old: Dict[str, int], new_values: Iterable[str]) -> Dict[str, in
     previously-unseen names appended at fresh IDs (sorted for determinism).
 
     Old IDs are preserved verbatim, so an embedding row trained for
-    'lab_a/sensapex_dual' keeps its meaning after extension.
+    'lab_a/sensapex_single' keeps its meaning after extension.
     """
     out = dict(old)
     additions = sorted({str(v) for v in new_values if str(v) not in out})
