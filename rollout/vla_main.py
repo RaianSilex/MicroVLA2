@@ -56,6 +56,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--embodiment", type=str, default=None)
     p.add_argument("--action-type", type=str, default=None)
     p.add_argument("--task-family", type=str, default=None)
+    p.add_argument("--resistance-topic", type=str, default=None,
+                   help="ROS topic with live pipette resistance (MΩ). Set it for patch-clamp "
+                        "prompts so the policy gets the contact spike; OMIT it for targeting "
+                        "(targeting was trained without resistance). No-op if the checkpoint "
+                        "wasn't trained with resistance.")
+    p.add_argument("--resistance-type", choices=("float32", "float64", "int_array"),
+                   default="float32", help="Message type of --resistance-topic.")
     return p.parse_args()
 
 
@@ -73,6 +80,8 @@ def _get_adapter(args):
             save_preview=args.save_preview,
             preview_path=args.preview_path,
             preview_every_n_frames=args.preview_every_n_frames,
+            resistance_topic=args.resistance_topic,
+            resistance_type=args.resistance_type,
         )
     raise ValueError(f"Unsupported adapter: {args.adapter}")
 
@@ -202,6 +211,7 @@ def main() -> None:
             obs = adapter.get_observation()
             img = obs.image_rgb
             state = obs.state.astype(np.float32)
+            resistance = getattr(obs, "resistance", None)  # live MΩ if --resistance-topic set
 
             if args.temporal_agg:
                 pred_action_chunk = _validate_action_chunk(
@@ -216,6 +226,7 @@ def main() -> None:
                         task_family=task_family,
                         state_dim=adapter.state_dim,
                         action_dim=adapter.action_dim,
+                        resistance=resistance,
                     ),
                     adapter.action_dim,
                 )
@@ -244,6 +255,7 @@ def main() -> None:
                             task_family=task_family,
                             state_dim=adapter.state_dim,
                             action_dim=adapter.action_dim,
+                            resistance=resistance,
                         ),
                         adapter.action_dim,
                     )

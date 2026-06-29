@@ -73,6 +73,8 @@ class SensapexDualAdapter:
         save_preview: bool = True,
         preview_path: str = "microvla_live.png",
         preview_every_n_frames: int = 5,
+        resistance_topic: str | None = None,
+        resistance_type: str = "float32",
     ):
         self.num_manipulators = int(num_manipulators)
         self.state_dim = self.num_manipulators * C.AXES_PER_MANIPULATOR
@@ -86,6 +88,8 @@ class SensapexDualAdapter:
             save_preview=save_preview,
             preview_path=preview_path,
             preview_every_n_frames=preview_every_n_frames,
+            resistance_topic=resistance_topic,
+            resistance_type=resistance_type,
         )
 
     def get_observation(self):
