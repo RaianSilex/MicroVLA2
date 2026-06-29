@@ -108,13 +108,26 @@ _REGION_ALIASES = {
 # Every region spelling the labels CSV may use.
 ACCEPTED_REGIONS = sorted(set(REGIONS) | set(_REGION_ALIASES))
 
-_TEMPLATES = [
+# Instruction phrasing depends on how many manipulators the dataset uses, so a
+# single-uMp dataset doesn't get "both manipulators" / "the two pipettes" prompts.
+_TEMPLATES_SINGLE = [
+    "move the manipulator toward the {r} cell",
+    "guide the pipette to the cell in the {r}",
+    "advance the needle to the {r} cell",
+    "target the {r} cell with the manipulator",
+    "bring the pipette to the {r} cell",
+]
+_TEMPLATES_DUAL = [
     "move both manipulators toward the {r} cell",
     "guide the pipettes to the cell in the {r}",
     "advance both needles to the {r} cell",
     "target the {r} cell with both manipulators",
     "bring the two pipettes to the {r} cell",
 ]
+
+
+def _templates_for(n_manipulators: int) -> list:
+    return _TEMPLATES_DUAL if int(n_manipulators) >= 2 else _TEMPLATES_SINGLE
 
 
 def normalize_region(raw: str) -> tuple[str, bool]:
@@ -132,12 +145,16 @@ def normalize_region(raw: str) -> tuple[str, bool]:
     return "center", False
 
 
-def instruction_for(trial_id: int, region: str) -> str:
-    """Deterministic, grounded, lexically-varied instruction for a trial."""
+def instruction_for(trial_id: int, region: str, n_manipulators: int = C.NUM_MANIPULATORS) -> str:
+    """Deterministic, grounded, lexically-varied instruction for a trial.
+
+    Phrasing matches the manipulator count (singular for 1, "both"/"two" for 2).
+    """
     canon, _ = normalize_region(region)
     phrases = _REGION_PHRASES[canon]
     phrase = phrases[trial_id % len(phrases)]
-    template = _TEMPLATES[trial_id % len(_TEMPLATES)]
+    templates = _templates_for(n_manipulators)
+    template = templates[trial_id % len(templates)]
     return template.format(r=phrase)
 
 
@@ -187,7 +204,9 @@ def load_or_scaffold_labels(path: Path, trial_ids: list[int]) -> dict[int, dict]
     return out
 
 
-def resolve_instruction(trial_id: int, labels: dict[int, dict]) -> tuple[str, str]:
+def resolve_instruction(
+    trial_id: int, labels: dict[int, dict], n_manipulators: int = C.NUM_MANIPULATORS
+) -> tuple[str, str]:
     """(instruction, canonical_region) for a trial, honoring a free-text override."""
     entry = labels.get(trial_id, {"region": "center", "instruction": ""})
     raw_region = entry.get("region", "center") or "center"
@@ -198,7 +217,7 @@ def resolve_instruction(trial_id: int, labels: dict[int, dict]) -> tuple[str, st
     override = entry.get("instruction", "")
     if override:
         return override, canon
-    return instruction_for(trial_id, canon), canon
+    return instruction_for(trial_id, canon, n_manipulators), canon
 
 
 # ---------------------------------------------------------------------------
@@ -362,7 +381,7 @@ def main() -> None:
                 actions = np.where(zero, states, actions)
                 print(f"[clean] trial_{trial_id}: held {n_fixed} uninitialized-target row(s)")
 
-        instruction, region = resolve_instruction(trial_id, labels)
+        instruction, region = resolve_instruction(trial_id, labels, args.manipulators)
         region_counts[region] = region_counts.get(region, 0) + 1
 
         resist = _trial_resistance(df) if has_resistance else None

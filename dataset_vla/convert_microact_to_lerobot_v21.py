@@ -194,7 +194,7 @@ def main() -> None:
                 actions = np.where(zero, states, actions)
                 print(f"[clean] trial_{trial_id}: held {n_fixed} uninitialized-target row(s)")
 
-        instruction, region = resolve_instruction(trial_id, labels)
+        instruction, region = resolve_instruction(trial_id, labels, args.manipulators)
         region_counts[region] = region_counts.get(region, 0) + 1
 
         raw_paths = (
